@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   content-manager:
     image: duckautomata/content-manager:latest
