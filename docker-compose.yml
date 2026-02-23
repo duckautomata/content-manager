@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  content-manager:
+    image: duckautomata/content-manager:latest
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    networks:
+      - content-network
+    restart: unless-stopped
+
+  webp-converter:
+    image: duckautomata/webp-converter:latest
+    ports:
+      - "8090:8090"
+    environment:
+      - PORT=8090
+    networks:
+      - content-network
+    restart: unless-stopped
+
+networks:
+  content-network:
+    driver: bridge

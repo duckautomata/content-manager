@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Content Manager</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>">
+</head>
+
+<body>
+    <div id="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <div class="app-container">
+        <header class="glass-header">
+            <div class="header-content">
+                <h1>Content Manager</h1>
+                <div class="header-controls">
+                    <div class="prefix-selector">
+                        <label for="prefix-input">Current Prefix:</label>
+                        <input type="text" id="prefix-input" value="home/" placeholder="e.g. site1/">
+                        <button id="refresh-btn" class="btn primary-btn">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="23 4 23 10 17 10"></polyline>
+                                <polyline points="1 20 1 14 7 14"></polyline>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                            </svg>
+                        </button>
+                    </div>
+                    <div class="search-box">
+                        <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2"
+                            fill="none" stroke-linecap="round" stroke-linejoin="round">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                        </svg>
+                        <input type="text" id="filter-input" placeholder="Filter by name...">
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <section class="upload-section">
+                <div id="dropzone" class="glass-panel dropzone">
+                    <div class="dropzone-content">
+                        <svg viewBox="0 0 24 24" width="48" height="48" stroke="currentColor" stroke-width="2"
+                            fill="none" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <h3>Drag & Drop files here</h3>
+                        <p>or click to browse</p>
+                        <input type="file" id="file-input" multiple hidden>
+                    </div>
+                </div>
+                <div id="upload-progress" class="upload-progress hidden">
+                    <div class="progress-bar">
+                        <div class="progress-fill"></div>
+                    </div>
+                    <span class="progress-text">Uploading...</span>
+                </div>
+            </section>
+
+            <section class="content-section">
+                <div class="section-header">
+                    <h2>Images</h2>
+                    <span id="images-count" class="badge">0</span>
+                </div>
+                <div id="images-grid" class="grid-container images-grid">
+                    <!-- Images will be injected here -->
+                </div>
+
+                <div class="section-header">
+                    <h2>Other Files</h2>
+                    <span id="others-count" class="badge">0</span>
+                </div>
+                <div id="others-list" class="list-container others-list">
+                    <!-- Other files will be injected here -->
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Preview Modal -->
+    <div id="preview-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel">
+            <button class="close-modal-btn">&times;</button>
+            <div class="modal-body">
+                <img id="modal-image" src="" alt="Preview">
+                <div class="modal-details">
+                    <h3 id="modal-title">filename</h3>
+                    <div class="modal-actions">
+                        <a id="modal-original-link" href="#" target="_blank" class="btn secondary-btn">Original</a>
+                        <a id="modal-preview-link" href="#" target="_blank" class="btn secondary-btn">WebP Prev</a>
+                        <button id="modal-delete-btn" class="btn danger-btn">Delete</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Upload Results Modal -->
+    <div id="upload-results-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel">
+            <button class="close-results-btn close-modal-btn">&times;</button>
+            <div class="modal-body">
+                <div class="modal-details" style="gap: 1.5rem;">
+                    <h3>Upload Results</h3>
+                    <div id="upload-results-list" style="display: flex; flex-direction: column; gap: 1rem;">
+                        <!-- Results injected here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Hidden File Input for Replace -->
+    <input type="file" id="replace-file-input" hidden>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
