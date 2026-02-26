@@ -1,5 +1,5 @@
 # Stage 1: Build Environment
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.26-bookworm AS builder
 ARG VIPS_VERSION=8.18.0
 
 # 1. Install Build Dependencies
