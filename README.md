@@ -101,7 +101,7 @@ The easiest way to run the docker image is to
    ```bash
    docker compose down
    ```
-   
+
 The application will be available at http://<server-address>:8000
 The webp-converter will be available at http://<server-address>:8090
 
