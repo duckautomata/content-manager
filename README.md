@@ -95,11 +95,11 @@ The easiest way to run the docker image is to
 2. Ensure your `.env` file is properly configured.
 3. Start the containers:
    ```bash
-   docker-compose up -d
+   docker compose up -d
    ```
 4. Stop the container:
    ```bash
-   docker-compose down
+   docker compose down
    ```
    
 The application will be available at http://<server-address>:8000

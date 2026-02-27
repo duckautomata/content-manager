@@ -408,7 +408,28 @@ function showUploadResults(results) {
     // Wire up copy buttons
     resultsList.querySelectorAll('.copy-id-btn').forEach(btn => {
         btn.addEventListener('click', () => {
-            navigator.clipboard.writeText(btn.dataset.id);
+            const textToCopy = btn.dataset.id;
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(textToCopy);
+            } else {
+                // Fallback for non-secure contexts
+                const textArea = document.createElement("textarea");
+                textArea.value = textToCopy;
+                // Avoid scrolling to bottom
+                textArea.style.top = "0";
+                textArea.style.left = "0";
+                textArea.style.position = "fixed";
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                } catch (err) {
+                    console.error('Fallback: Oops, unable to copy', err);
+                }
+                document.body.removeChild(textArea);
+            }
+
             const originalHTML = btn.innerHTML;
             btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
             setTimeout(() => { btn.innerHTML = originalHTML; }, 1500);
