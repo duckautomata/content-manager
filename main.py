@@ -19,7 +19,7 @@ R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
-CONVERSION_SERVICE_URL = os.environ.get("CONVERSION_SERVICE_URL", "http://webp-converter:8080")
+CONVERSION_SERVICE_URL = os.environ.get("CONVERSION_SERVICE_URL", "http://webp-converter:8090")
 PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")  # Add trailing slash if used, mostly for returning public URLs to frontend
 
 # S3 Client setup
@@ -64,12 +64,12 @@ async def get_content(prefix: str):
         if filename.endswith("_p.webp"):
             uuid_key = filename[:-7]
             if uuid_key not in images:
-                images[uuid_key] = {"prefix": prefix, "slug": uuid_key, "files": {}}
+                images[uuid_key] = {"prefix": prefix, "slug": uuid_key, "files": {}, "last_modified": item['LastModified'].isoformat()}
             images[uuid_key]["files"]["preview"] = filename
         elif filename.endswith("_t.webp"):
             uuid_key = filename[:-7]
             if uuid_key not in images:
-                images[uuid_key] = {"prefix": prefix, "slug": uuid_key, "files": {}}
+                images[uuid_key] = {"prefix": prefix, "slug": uuid_key, "files": {}, "last_modified": item['LastModified'].isoformat()}
             images[uuid_key]["files"]["thumbnail"] = filename
         else:
             # Could be original image or non-image. We check if there's an associated _p or _t to group it, or do it by mime types.
@@ -82,11 +82,16 @@ async def get_content(prefix: str):
         name_no_ext = os.path.splitext(other["filename"])[0]
         if name_no_ext in images:
             images[name_no_ext]["files"]["original"] = other["filename"]
+            # To ensure images have last_modified if only original was processed first, though usually _p or _t are processed
+            if "last_modified" not in images[name_no_ext]:
+                images[name_no_ext]["last_modified"] = other["last_modified"]
         else:
             final_others.append(other)
             
-    # Format images list
+    # Format images list & sort by date uploaded
     images_list = list(images.values())
+    images_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
+    final_others.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
             
     return {"images": images_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX}
 

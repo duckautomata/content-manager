@@ -77,6 +77,11 @@ This will only be called if the uploaded file is an image.
 
 The application UI will be available at [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 
+If you want to expose the app to your network, you can use the `--host` flag:
+```bash
+uvicorn main:app --reload --port 8000 --host 0.0.0.0
+```
+
 ## Docker
 
 ### Host Requirements
@@ -104,6 +109,11 @@ The easiest way to run the docker image is to
 
 The application will be available at http://<server-address>:8000
 The webp-converter will be available at http://<server-address>:8090
+
+To update the image, run:
+```bash
+docker compose pull && docker compose up -d
+```
 
 ### Building new image
 To build a new image with the latest tag, run

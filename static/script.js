@@ -1,5 +1,5 @@
 const state = {
-    prefix: 'home/',
+    prefix: new URLSearchParams(window.location.search).get('prefix') || 'home/',
     images: [],
     others: [],
     publicUrlPrefix: '',
@@ -44,6 +44,24 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchContent();
 });
 
+// Update URL without reloading
+function updateUrlPrefix(newPrefix) {
+    const url = new URL(window.location);
+    url.searchParams.set('prefix', newPrefix);
+    window.history.pushState({}, '', url);
+}
+
+// Handle browser back/forward buttons
+window.addEventListener('popstate', () => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const newPrefix = urlParams.get('prefix') || 'home/';
+    if (state.prefix !== newPrefix) {
+        state.prefix = newPrefix;
+        prefixInput.value = state.prefix;
+        fetchContent();
+    }
+});
+
 filterInput.addEventListener('input', () => {
     state.filter = filterInput.value.toLowerCase();
     renderContent();
@@ -56,6 +74,7 @@ refreshBtn.addEventListener('click', () => {
         state.prefix += '/';
         prefixInput.value = state.prefix;
     }
+    updateUrlPrefix(state.prefix);
     fetchContent();
 });
 
@@ -274,6 +293,9 @@ function openModal(img) {
     const previewKey = img.files.preview || img.files.original || img.files.thumbnail;
     const origKey = img.files.original || img.files.preview || img.files.thumbnail;
 
+    // Clear previous image
+    modalImage.src = '';
+    // Set to new image
     modalImage.src = getPublicUrl(state.prefix + previewKey);
     modalTitle.textContent = img.slug;
 
@@ -347,15 +369,34 @@ async function handleFiles(files) {
                 successCount++;
                 const data = await res.json();
                 uploadResults.push({ ...data, original_name: file.name });
+            } else {
+                let errorMessage = `HTTP Error ${res.status}`;
+                try {
+                    const data = await res.json();
+                    if (data.detail) {
+                        errorMessage = data.detail;
+                    }
+                } catch (e) { /* ignore parse error */ }
+
+                uploadResults.push({
+                    status: 'error',
+                    original_name: file.name,
+                    error_message: errorMessage
+                });
+                console.error(`Failed to upload ${file.name}`, errorMessage);
             }
-            else console.error(`Failed to upload ${file.name}`);
         } catch (err) {
+            uploadResults.push({
+                status: 'error',
+                original_name: file.name,
+                error_message: err.message || 'Network error'
+            });
             console.error(`Error uploading ${file.name}`, err);
         }
     }
 
     progressFill.style.width = '100%';
-    progressText.textContent = `Complete! ${successCount} successful.`;
+    progressText.textContent = `Complete! ${successCount} successful, ${files.length - successCount} failed.`;
 
     setTimeout(() => {
         uploadProgress.classList.add('hidden');
@@ -364,7 +405,7 @@ async function handleFiles(files) {
         if (uploadResults.length > 0) {
             showUploadResults(uploadResults);
         }
-    }, 1000);
+    }, 1500);
 }
 
 function showUploadResults(results) {
@@ -377,7 +418,16 @@ function showUploadResults(results) {
         div.style.borderRadius = '8px';
         div.style.border = '1px solid var(--glass-border)';
 
-        if (res.type === 'image') {
+        if (res.status === 'error') {
+            div.style.border = '1px solid var(--danger)';
+            div.style.background = 'rgba(239, 68, 68, 0.1)';
+            div.innerHTML = `
+                <strong style="color: var(--danger); display:block; margin-bottom:0.5rem;">Failed to upload <span>${res.original_name}</span></strong>
+                <div style="font-size: 0.85rem; color: var(--text-muted);">
+                    <div><span style="color:var(--text-main);">Error:</span> ${res.error_message}</div>
+                </div>
+            `;
+        } else if (res.type === 'image') {
             div.innerHTML = `
                 <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
                     <strong style="color: var(--primary);">${res.slug}</strong>
@@ -386,7 +436,7 @@ function showUploadResults(results) {
                     </button>
                 </div>
                 <div style="font-size: 0.85rem; color: var(--text-muted); display:flex; flex-direction:column; gap:0.25rem;">
-                    <div><span style="color:var(--text-main);">Original:</span> ${res.original}</div>
+                    <div><span style="color:var(--text-main);">Original:</span> ${res.original_name} -> ${res.original}</div>
                     <div><span style="color:var(--text-main);">Preview:</span> ${res.preview}</div>
                     <div><span style="color:var(--text-main);">Thumbnail:</span> ${res.thumbnail}</div>
                 </div>
