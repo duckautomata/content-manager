@@ -50,6 +50,7 @@ async def get_content(prefix: str):
     contents = response.get("Contents", [])
     
     images = {}
+    videos = {}
     others = []
     
     # Process contents to separate images (with original, _p, _t) from others
@@ -80,20 +81,29 @@ async def get_content(prefix: str):
     final_others = []
     for other in others:
         name_no_ext = os.path.splitext(other["filename"])[0]
+        ext = os.path.splitext(other["filename"])[1].lower()
         if name_no_ext in images:
             images[name_no_ext]["files"]["original"] = other["filename"]
             # To ensure images have last_modified if only original was processed first, though usually _p or _t are processed
             if "last_modified" not in images[name_no_ext]:
                 images[name_no_ext]["last_modified"] = other["last_modified"]
+                
+            if ext in ['.mp4', '.mov', '.webm', '.mkv', '.avi']:
+                videos[name_no_ext] = images.pop(name_no_ext)
+                videos[name_no_ext]["type"] = "video"
+            else:
+                images[name_no_ext]["type"] = "image"
         else:
             final_others.append(other)
             
     # Format images list & sort by date uploaded
     images_list = list(images.values())
+    videos_list = list(videos.values())
     images_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
+    videos_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     final_others.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
             
-    return {"images": images_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX}
+    return {"images": images_list, "videos": videos_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX}
 
 @app.post("/api/upload")
 async def upload_content(prefix: str = Form(...), override_filename: str = Form(None), file: UploadFile = File(...)):
@@ -110,8 +120,9 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
 
         # 1. Check if image
         is_image = mime_type.startswith("image/")
+        is_video = mime_type.startswith("video/") or original_ext.lower() in [".mp4", ".mov", ".webm", ".mkv", ".avi"]
         
-        if not is_image:
+        if not (is_image or is_video):
             # Upload non-image
             target_filename = override_filename if override_filename else file.filename
             file_key = f"{prefix}{target_filename}"
@@ -169,7 +180,7 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
                 
         return {
             "status": "success", 
-            "type": "image",
+            "type": "video" if is_video else "image",
             "slug": short_uuid,
             "original": original_key,
             "preview": preview_key, 

@@ -1,6 +1,7 @@
 const state = {
     prefix: new URLSearchParams(window.location.search).get('prefix') || 'home/',
     images: [],
+    videos: [],
     others: [],
     publicUrlPrefix: '',
     filter: ''
@@ -17,6 +18,8 @@ const progressText = document.querySelector('.progress-text');
 
 const imagesGrid = document.getElementById('images-grid');
 const imagesCount = document.getElementById('images-count');
+const videosGrid = document.getElementById('videos-grid');
+const videosCount = document.getElementById('videos-count');
 const othersList = document.getElementById('others-list');
 const othersCount = document.getElementById('others-count');
 
@@ -189,6 +192,7 @@ function getPublicUrl(key) {
 async function fetchContent() {
     refreshBtn.classList.add('spinner', 'loading');
     imagesGrid.innerHTML = '';
+    videosGrid.innerHTML = '';
     othersList.innerHTML = '';
 
     try {
@@ -197,6 +201,7 @@ async function fetchContent() {
         const data = await res.json();
 
         state.images = data.images || [];
+        state.videos = data.videos || [];
         state.others = data.others || [];
         state.publicUrlPrefix = data.public_url_prefix || '';
 
@@ -212,6 +217,7 @@ async function fetchContent() {
 // Render UI
 function renderContent() {
     imagesGrid.innerHTML = '';
+    videosGrid.innerHTML = '';
     othersList.innerHTML = '';
 
     let imageMatchCount = 0;
@@ -236,6 +242,29 @@ function renderContent() {
         imagesGrid.appendChild(card);
     });
     imagesCount.textContent = imageMatchCount;
+
+    let videoMatchCount = 0;
+    // Videos
+    state.videos.forEach(vid => {
+        if (state.filter && !vid.slug.toLowerCase().includes(state.filter)) return;
+        videoMatchCount++;
+
+        const thumbKey = vid.files.thumbnail || vid.files.original; // Fallback to original if no thumb somehow
+        const url = getPublicUrl(state.prefix + thumbKey);
+
+        const card = document.createElement('div');
+        card.className = 'image-card glass-panel';
+        card.innerHTML = `
+            <img src="${url}" alt="${vid.slug}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎥</text></svg>'">
+            <div class="overlay">
+                <span>${vid.slug}</span>
+            </div>
+        `;
+
+        card.addEventListener('click', () => openModal(vid));
+        videosGrid.appendChild(card);
+    });
+    videosCount.textContent = videoMatchCount;
 
     let othersMatchCount = 0;
     // Others
@@ -427,7 +456,7 @@ function showUploadResults(results) {
                     <div><span style="color:var(--text-main);">Error:</span> ${res.error_message}</div>
                 </div>
             `;
-        } else if (res.type === 'image') {
+        } else if (res.type === 'image' || res.type === 'video') {
             div.innerHTML = `
                 <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
                     <strong style="color: var(--primary);">${res.slug}</strong>

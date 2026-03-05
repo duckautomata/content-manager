@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     libexpat1-dev \
     libglib2.0-dev \
     liborc-0.4-dev \
+    ffmpeg \
     # AVIF / HEIC Dependencies
     libaom-dev \
     libde265-dev \
@@ -79,6 +80,7 @@ RUN apt-get update && apt-get install -y \
     libx265-199 \
     ca-certificates \
     zip \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Copy compiled libvips libraries

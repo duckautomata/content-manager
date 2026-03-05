@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -24,6 +26,7 @@ var supportedInputFormats = map[string]bool{
 	"jpg": true, "jpeg": true, "png": true, "apng": true,
 	"gif": true, "webp": true, "avif": true, "heic": true,
 	"heif": true, "tiff": true, "tif": true, "bmp": true,
+	"mp4": true, "mov": true, "webm": true, "mkv": true, "avi": true,
 }
 
 func main() {
@@ -142,7 +145,8 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	img, err := loadImage(r.Body)
+	contentType := r.Header.Get("Content-Type")
+	img, err := loadImage(r.Body, contentType)
 	if err != nil {
 		http.Error(w, "Failed to load image", http.StatusBadRequest)
 		return
@@ -166,7 +170,8 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	img, err := loadImage(r.Body)
+	contentType := r.Header.Get("Content-Type")
+	img, err := loadImage(r.Body, contentType)
 	if err != nil {
 		http.Error(w, "Failed to load image", http.StatusBadRequest)
 		return
@@ -297,11 +302,35 @@ func handleSlug(w http.ResponseWriter, r *http.Request) {
 
 // ---------------- Helpers ----------------
 
-func loadImage(r io.Reader) (*vips.ImageRef, error) {
+func extractVideoFrame(vidBuf []byte) ([]byte, error) {
+	cmd := exec.Command("ffmpeg", "-y", "-i", "pipe:0", "-frames:v", "1", "-c:v", "png", "-f", "image2", "-")
+	cmd.Stdin = bytes.NewReader(vidBuf)
+
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func loadImage(r io.Reader, contentType string) (*vips.ImageRef, error) {
 	buf, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
+
+	if strings.HasPrefix(contentType, "video/") || (len(buf) > 8 && string(buf[4:8]) == "ftyp") {
+		frameBuf, err := extractVideoFrame(buf)
+		if err == nil && len(frameBuf) > 0 {
+			buf = frameBuf
+		} else {
+			fmt.Printf("Warning: Failed to extract frame with ffmpeg: %v\n", err)
+		}
+	}
+
 	params := vips.NewImportParams()
 	params.NumPages.Set(-1)
 	return vips.LoadImageFromBuffer(buf, params)
