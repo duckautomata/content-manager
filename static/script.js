@@ -442,10 +442,12 @@ function showUploadResults(results) {
 
     results.forEach(res => {
         const div = document.createElement('div');
+        div.className = 'upload-result-item';
         div.style.padding = '1rem';
         div.style.background = 'var(--glass-bg)';
         div.style.borderRadius = '8px';
         div.style.border = '1px solid var(--glass-border)';
+        div.style.transition = 'all 0.3s ease';
 
         if (res.status === 'error') {
             div.style.border = '1px solid var(--danger)';
@@ -511,7 +513,17 @@ function showUploadResults(results) {
 
             const originalHTML = btn.innerHTML;
             btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
-            setTimeout(() => { btn.innerHTML = originalHTML; }, 1500);
+
+            const parentItem = btn.closest('.upload-result-item');
+            if (parentItem) {
+                parentItem.style.background = 'rgba(52, 211, 153, 0.2)';
+                parentItem.style.borderColor = 'rgba(52, 211, 153, 0.5)';
+                setTimeout(() => {
+                    btn.innerHTML = originalHTML;
+                }, 1500);
+            } else {
+                setTimeout(() => { btn.innerHTML = originalHTML; }, 1500);
+            }
         });
     });
 }
