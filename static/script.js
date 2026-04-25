@@ -30,6 +30,16 @@ let currentReplaceFilename = null;
 const modal = document.getElementById('preview-modal');
 const modalImage = document.getElementById('modal-image');
 const modalTitle = document.getElementById('modal-title');
+const modalMeta = document.getElementById('modal-meta');
+
+const confirmModal = document.getElementById('confirm-modal');
+const confirmTitle = document.getElementById('confirm-title');
+const confirmMessage = document.getElementById('confirm-message');
+const confirmOkBtn = document.getElementById('confirm-ok-btn');
+const confirmCancelBtn = document.getElementById('confirm-cancel-btn');
+const confirmBackdrop = confirmModal.querySelector('.modal-backdrop');
+
+const toastContainer = document.getElementById('toast-container');
 const modalOrigLink = document.getElementById('modal-original-link');
 const modalPrevLink = document.getElementById('modal-preview-link');
 const modalDelBtn = document.getElementById('modal-delete-btn');
@@ -46,6 +56,67 @@ document.addEventListener('DOMContentLoaded', () => {
     prefixInput.value = state.prefix;
     fetchContent();
 });
+
+// Toasts
+function toast(message, type = 'info') {
+    const el = document.createElement('div');
+    el.className = `toast toast-${type}`;
+    el.textContent = message;
+    toastContainer.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    setTimeout(() => {
+        el.classList.remove('show');
+        setTimeout(() => el.remove(), 250);
+    }, 3500);
+}
+
+// Custom confirm dialog. Returns Promise<boolean>.
+function confirmAction({ title = 'Confirm', message = '', confirmText = 'Confirm', danger = true } = {}) {
+    return new Promise(resolve => {
+        confirmTitle.textContent = title;
+        confirmMessage.textContent = message;
+        confirmOkBtn.textContent = confirmText;
+        confirmOkBtn.className = `btn ${danger ? 'danger-btn' : 'primary-btn'}`;
+
+        const cleanup = (result) => {
+            confirmModal.classList.add('hidden');
+            confirmOkBtn.removeEventListener('click', onOk);
+            confirmCancelBtn.removeEventListener('click', onCancel);
+            confirmBackdrop.removeEventListener('click', onCancel);
+            document.removeEventListener('keydown', onKey);
+            resolve(result);
+        };
+        const onOk = () => cleanup(true);
+        const onCancel = () => cleanup(false);
+        const onKey = (e) => {
+            if (e.key === 'Escape') onCancel();
+            else if (e.key === 'Enter') onOk();
+        };
+
+        confirmOkBtn.addEventListener('click', onOk);
+        confirmCancelBtn.addEventListener('click', onCancel);
+        confirmBackdrop.addEventListener('click', onCancel);
+        document.addEventListener('keydown', onKey);
+
+        confirmModal.classList.remove('hidden');
+        confirmOkBtn.focus();
+    });
+}
+
+function formatBytes(bytes) {
+    if (bytes == null) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function formatDate(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
 
 // Update URL without reloading
 function updateUrlPrefix(newPrefix) {
@@ -65,9 +136,13 @@ window.addEventListener('popstate', () => {
     }
 });
 
+let filterDebounceTimer;
 filterInput.addEventListener('input', () => {
-    state.filter = filterInput.value.toLowerCase();
-    renderContent();
+    clearTimeout(filterDebounceTimer);
+    filterDebounceTimer = setTimeout(() => {
+        state.filter = filterInput.value.toLowerCase();
+        renderContent();
+    }, 200);
 });
 
 // Event Listeners
@@ -153,7 +228,7 @@ replaceFileInput.addEventListener('change', async () => {
         }
     } catch (err) {
         console.error(err);
-        alert('Failed to replace file.');
+        toast('Failed to replace file.', 'error');
 
         setTimeout(() => {
             uploadProgress.classList.add('hidden');
@@ -208,7 +283,7 @@ async function fetchContent() {
         renderContent();
     } catch (err) {
         console.error(err);
-        alert('Error fetching content. Check console for details.');
+        toast('Error fetching content. Check console for details.', 'error');
     } finally {
         refreshBtn.classList.remove('spinner', 'loading');
     }
@@ -309,7 +384,7 @@ function renderContent() {
         });
 
         const delBtn = div.querySelector('.delete-item-btn');
-        delBtn.addEventListener('click', () => deleteItem(item.key));
+        delBtn.addEventListener('click', () => deleteItem(item));
 
         othersList.appendChild(div);
     });
@@ -322,10 +397,28 @@ function openModal(img) {
     const previewKey = img.files.preview || img.files.original || img.files.thumbnail;
     const origKey = img.files.original || img.files.preview || img.files.thumbnail;
 
+    const metaParts = {
+        dim: '',
+        size: formatBytes(img.size),
+        date: formatDate(img.last_modified),
+    };
+    const renderMeta = () => {
+        modalMeta.textContent = [metaParts.dim, metaParts.size, metaParts.date]
+            .filter(Boolean)
+            .join(' • ');
+    };
+
     // Clear previous image
     modalImage.src = '';
+    renderMeta();
     // Set to new image
     modalImage.src = getPublicUrl(state.prefix + previewKey);
+    modalImage.onload = () => {
+        if (modalImage.naturalWidth && modalImage.naturalHeight) {
+            metaParts.dim = `${modalImage.naturalWidth} × ${modalImage.naturalHeight}`;
+            renderMeta();
+        }
+    };
     modalTitle.textContent = img.slug;
 
     modalOrigLink.href = getPublicUrl(state.prefix + origKey);
@@ -334,19 +427,38 @@ function openModal(img) {
     modalPrevLink.href = getPublicUrl(state.prefix + img.files.preview);
     modalPrevLink.style.display = img.files.preview ? 'inline-flex' : 'none';
 
-    // Delete action needs to delete all associated files
+    // Delete action removes all associated files in one bulk request
     modalDelBtn.onclick = async () => {
-        if (confirm(`Delete image group ${img.slug}?`)) {
-            const keys = [img.files.original, img.files.preview, img.files.thumbnail]
-                .filter(Boolean)
-                .map(k => state.prefix + k);
+        const ok = await confirmAction({
+            title: 'Delete file',
+            message: `Delete ${img.slug} and all its variants?`,
+            confirmText: 'Delete',
+        });
+        if (!ok) return;
 
-            closeModal();
-            for (let key of keys) {
-                await fetch(`/api/content?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
+        const keys = [img.files.original, img.files.preview, img.files.thumbnail]
+            .filter(Boolean)
+            .map(k => state.prefix + k);
+
+        closeModal();
+        try {
+            const res = await fetch('/api/content/bulk-delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keys }),
+            });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            if (data.errors && data.errors.length) {
+                toast(`Deleted ${data.deleted.length} of ${keys.length} files`, 'error');
+            } else {
+                toast(`Deleted ${img.slug}`, 'success');
             }
-            fetchContent();
+        } catch (err) {
+            console.error(err);
+            toast('Delete failed', 'error');
         }
+        fetchContent();
     };
 
     modal.classList.remove('hidden');
@@ -358,16 +470,21 @@ function closeModal() {
     document.body.style.overflow = '';
 }
 
-async function deleteItem(key) {
-    if (confirm(`Delete ${key}?`)) {
-        try {
-            const res = await fetch(`/api/content?key=${encodeURIComponent(key)}`, { method: 'DELETE' });
-            if (!res.ok) throw new Error('Delete failed');
-            fetchContent();
-        } catch (err) {
-            console.error(err);
-            alert('Delete failed');
-        }
+async function deleteItem(item) {
+    const ok = await confirmAction({
+        title: 'Delete file',
+        message: `Delete ${item.filename}?`,
+        confirmText: 'Delete',
+    });
+    if (!ok) return;
+    try {
+        const res = await fetch(`/api/content?key=${encodeURIComponent(item.key)}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error('Delete failed');
+        toast(`Deleted ${item.filename}`, 'success');
+        fetchContent();
+    } catch (err) {
+        console.error(err);
+        toast('Delete failed', 'error');
     }
 }
 

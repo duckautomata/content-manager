@@ -36,7 +36,7 @@ This will only be called if the uploaded file is an image.
 ## Development
 
 ### Tech Used (content manager only)
-- Python 1.12
+- Python 3.12
 
 ### Requirements
 - Python

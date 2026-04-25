@@ -1,3 +1,4 @@
+import asyncio
 import os
 import boto3
 import httpx
@@ -5,6 +6,7 @@ import mimetypes
 import logging
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,8 +27,8 @@ PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")  # Add trailing slas
 # S3 Client setup
 def get_s3_client():
     if not all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
-        print("WARNING: R2 credentials missing. S3 operations will fail.")
-        return None
+        logger.warning("R2 credentials missing. S3 operations will fail.")
+        os.close(1)
     return boto3.client(
         's3',
         endpoint_url=R2_ENDPOINT_URL,
@@ -36,42 +38,50 @@ def get_s3_client():
 
 s3 = get_s3_client()
 
+def _list_all_objects(prefix: str):
+    paginator = s3.get_paginator("list_objects_v2")
+    contents = []
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
+        contents.extend(page.get("Contents", []))
+    return contents
+
+
+class BulkDeleteRequest(BaseModel):
+    keys: list[str]
+
 @app.get("/api/content")
 async def get_content(prefix: str):
     if not s3:
         raise HTTPException(status_code=500, detail="S3 client not configured")
-        
+
     try:
-        response = s3.list_objects_v2(Bucket=R2_BUCKET_NAME, Prefix=prefix)
+        contents = await asyncio.to_thread(_list_all_objects, prefix)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-        
-    contents = response.get("Contents", [])
-    
     images = {}
     videos = {}
     others = []
-    
+
     # Process contents to separate images (with original, _p, _t) from others
     for item in contents:
         key = item['Key']
         filename = key[len(prefix):] if key.startswith(prefix) else key
         if not filename:
             continue
-            
+
         # Very simple grouping based on filenames ending in _p.webp or _t.webp
         # We will assume image UUIDs are used.
         if filename.endswith("_p.webp"):
             uuid_key = filename[:-7]
-            if uuid_key not in images:
-                images[uuid_key] = {"prefix": prefix, "slug": uuid_key, "files": {}, "last_modified": item['LastModified'].isoformat()}
-            images[uuid_key]["files"]["preview"] = filename
+            group = images.setdefault(uuid_key, {"prefix": prefix, "slug": uuid_key, "files": {}, "size": 0, "last_modified": item['LastModified'].isoformat()})
+            group["files"]["preview"] = filename
+            group["size"] += item['Size']
         elif filename.endswith("_t.webp"):
             uuid_key = filename[:-7]
-            if uuid_key not in images:
-                images[uuid_key] = {"prefix": prefix, "slug": uuid_key, "files": {}, "last_modified": item['LastModified'].isoformat()}
-            images[uuid_key]["files"]["thumbnail"] = filename
+            group = images.setdefault(uuid_key, {"prefix": prefix, "slug": uuid_key, "files": {}, "size": 0, "last_modified": item['LastModified'].isoformat()})
+            group["files"]["thumbnail"] = filename
+            group["size"] += item['Size']
         else:
             # Could be original image or non-image. We check if there's an associated _p or _t to group it, or do it by mime types.
             # We'll just add to 'others' for now and resolve grouping after first pass
@@ -83,26 +93,27 @@ async def get_content(prefix: str):
         name_no_ext = os.path.splitext(other["filename"])[0]
         ext = os.path.splitext(other["filename"])[1].lower()
         if name_no_ext in images:
-            images[name_no_ext]["files"]["original"] = other["filename"]
-            # To ensure images have last_modified if only original was processed first, though usually _p or _t are processed
-            if "last_modified" not in images[name_no_ext]:
-                images[name_no_ext]["last_modified"] = other["last_modified"]
-                
+            group = images[name_no_ext]
+            group["files"]["original"] = other["filename"]
+            group["size"] = group.get("size", 0) + other["size"]
+            # Original is the source of truth for upload date
+            group["last_modified"] = other["last_modified"]
+
             if ext in ['.mp4', '.mov', '.webm', '.mkv', '.avi']:
                 videos[name_no_ext] = images.pop(name_no_ext)
                 videos[name_no_ext]["type"] = "video"
             else:
-                images[name_no_ext]["type"] = "image"
+                group["type"] = "image"
         else:
             final_others.append(other)
-            
+
     # Format images list & sort by date uploaded
     images_list = list(images.values())
     videos_list = list(videos.values())
     images_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     videos_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     final_others.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
-            
+
     return {"images": images_list, "videos": videos_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX}
 
 @app.post("/api/upload")
@@ -110,7 +121,7 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
     try:
         if not s3:
             raise HTTPException(status_code=500, detail="S3 client not configured")
-    
+
         content = await file.read()
         file_name = "default-filename"
         if file.filename:
@@ -121,17 +132,17 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
         # 1. Check if image
         is_image = mime_type.startswith("image/")
         is_video = mime_type.startswith("video/") or original_ext.lower() in [".mp4", ".mov", ".webm", ".mkv", ".avi"]
-        
+
         if not (is_image or is_video):
             # Upload non-image
             target_filename = override_filename if override_filename else file.filename
             file_key = f"{prefix}{target_filename}"
-            s3.put_object(Bucket=R2_BUCKET_NAME, Key=file_key, Body=content, ContentType=mime_type)
+            await asyncio.to_thread(s3.put_object, Bucket=R2_BUCKET_NAME, Key=file_key, Body=content, ContentType=mime_type)
             return {"status": "success", "type": "other", "key": file_key}
-            
-        # If image:
+
+        # If image/video: convert everything FIRST, then upload, so a conversion
+        # failure doesn't leave orphaned objects in the bucket.
         async with httpx.AsyncClient() as client:
-            # Get slug
             try:
                 filename_for_conversion = file.filename or "image.png"
                 slug_resp = await client.get(f"{CONVERSION_SERVICE_URL}/slug", params={"name": filename_for_conversion})
@@ -141,49 +152,66 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
             except Exception as e:
                 logger.exception("Failed to get slug from conversion service")
                 raise HTTPException(status_code=500, detail=f"Failed to get slug: {e}")
-                
+
             original_key = f"{prefix}{short_uuid}{original_ext}"
             preview_key = f"{prefix}{short_uuid}_p.webp"
             thumbnail_key = f"{prefix}{short_uuid}_t.webp"
-            
-            # Upload original
-            s3.put_object(Bucket=R2_BUCKET_NAME, Key=original_key, Body=content, ContentType=mime_type)
-            
-            # Convert to WebP preview
+
             try:
                 preview_resp = await client.post(
-                    f"{CONVERSION_SERVICE_URL}/convert", 
+                    f"{CONVERSION_SERVICE_URL}/convert",
                     content=content,
                     headers={"Content-Type": mime_type}
                 )
                 preview_resp.raise_for_status()
                 preview_content = preview_resp.content
-                s3.put_object(Bucket=R2_BUCKET_NAME, Key=preview_key, Body=preview_content, ContentType="image/webp")
             except Exception as e:
                 logger.exception("Failed to convert image to preview")
                 raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
-                
-            # Convert to Thumbnail
+
             try:
                 thumb_resp = await client.post(
-                    f"{CONVERSION_SERVICE_URL}/thumbnail", 
-                    params={"height": 128}, 
+                    f"{CONVERSION_SERVICE_URL}/thumbnail",
+                    params={"height": 128},
                     content=content,
                     headers={"Content-Type": mime_type}
                 )
                 thumb_resp.raise_for_status()
                 thumb_content = thumb_resp.content
-                s3.put_object(Bucket=R2_BUCKET_NAME, Key=thumbnail_key, Body=thumb_content, ContentType="image/webp")
             except Exception as e:
                 logger.exception("Failed to create thumbnail")
                 raise HTTPException(status_code=500, detail=f"Thumbnail conversion failed: {e}")
-                
+
+        # All conversions succeeded — upload all three. If any upload fails,
+        # roll back what was already written so we don't leave orphans.
+        uploads = [
+            (original_key, content, mime_type),
+            (preview_key, preview_content, "image/webp"),
+            (thumbnail_key, thumb_content, "image/webp"),
+        ]
+        uploaded_keys = []
+        try:
+            for key, body, ctype in uploads:
+                await asyncio.to_thread(
+                    s3.put_object,
+                    Bucket=R2_BUCKET_NAME, Key=key, Body=body, ContentType=ctype,
+                )
+                uploaded_keys.append(key)
+        except Exception as e:
+            logger.exception("Upload failed mid-flight, rolling back")
+            for k in uploaded_keys:
+                try:
+                    await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=k)
+                except Exception:
+                    logger.exception("Rollback failed for key %s", k)
+            raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+
         return {
-            "status": "success", 
+            "status": "success",
             "type": "video" if is_video else "image",
             "slug": short_uuid,
             "original": original_key,
-            "preview": preview_key, 
+            "preview": preview_key,
             "thumbnail": thumbnail_key
         }
     except HTTPException as http_exc:
@@ -198,10 +226,35 @@ async def delete_content(key: str):
     if not s3:
         raise HTTPException(status_code=500, detail="S3 client not configured")
     try:
-        s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+        await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=key)
         return {"status": "success", "deleted": key}
     except Exception as e:
-         raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/content/bulk-delete")
+async def bulk_delete_content(req: BulkDeleteRequest):
+    if not s3:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+    if not req.keys:
+        return {"deleted": [], "errors": []}
+    if len(req.keys) > 1000:
+        # S3 DeleteObjects caps at 1000 per call; reject rather than silently drop
+        raise HTTPException(status_code=400, detail="Cannot delete more than 1000 keys per request")
+    try:
+        resp = await asyncio.to_thread(
+            s3.delete_objects,
+            Bucket=R2_BUCKET_NAME,
+            Delete={"Objects": [{"Key": k} for k in req.keys], "Quiet": False},
+        )
+        deleted = [d["Key"] for d in resp.get("Deleted", [])]
+        errors = [
+            {"key": e.get("Key"), "code": e.get("Code"), "message": e.get("Message")}
+            for e in resp.get("Errors", [])
+        ]
+        return {"deleted": deleted, "errors": errors}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Ensure static folder exists
 os.makedirs("static", exist_ok=True)

@@ -72,6 +72,14 @@
 
             <section class="content-section">
                 <div class="section-header">
+                    <h2>Other Files</h2>
+                    <span id="others-count" class="badge">0</span>
+                </div>
+                <div id="others-list" class="list-container others-list">
+                    <!-- Other files will be injected here -->
+                </div>
+
+                <div class="section-header">
                     <h2>Images</h2>
                     <span id="images-count" class="badge">0</span>
                 </div>
@@ -86,14 +94,6 @@
                 <div id="videos-grid" class="grid-container videos-grid">
                     <!-- Videos will be injected here -->
                 </div>
-
-                <div class="section-header">
-                    <h2>Other Files</h2>
-                    <span id="others-count" class="badge">0</span>
-                </div>
-                <div id="others-list" class="list-container others-list">
-                    <!-- Other files will be injected here -->
-                </div>
             </section>
         </main>
     </div>
@@ -107,6 +107,7 @@
                 <img id="modal-image" src="" alt="Preview">
                 <div class="modal-details">
                     <h3 id="modal-title">filename</h3>
+                    <p id="modal-meta" class="modal-meta"></p>
                     <div class="modal-actions">
                         <a id="modal-original-link" href="#" target="_blank" class="btn secondary-btn">Original</a>
                         <a id="modal-preview-link" href="#" target="_blank" class="btn secondary-btn">WebP Prev</a>
@@ -132,6 +133,26 @@
             </div>
         </div>
     </div>
+
+    <!-- Confirm Modal -->
+    <div id="confirm-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel confirm-modal-content">
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3 id="confirm-title">Confirm</h3>
+                    <p id="confirm-message"></p>
+                    <div class="modal-actions">
+                        <button id="confirm-cancel-btn" class="btn secondary-btn">Cancel</button>
+                        <button id="confirm-ok-btn" class="btn danger-btn">Confirm</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container"></div>
 
     <!-- Hidden File Input for Replace -->
     <input type="file" id="replace-file-input" hidden>
