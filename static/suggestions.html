@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Suggestions — Content Manager</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📥</text></svg>">
+</head>
+
+<body>
+    <div id="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <div class="app-container">
+        <header class="glass-header">
+            <div class="header-content">
+                <h1>Suggestions</h1>
+                <div class="header-controls">
+                    <a href="index.html" class="btn secondary-btn">← Manager</a>
+                    <div class="search-box">
+                        <label for="status-filter" class="visually-hidden">Status</label>
+                        <select id="status-filter">
+                            <option value="pending" selected>Pending</option>
+                            <option value="approved">Approved</option>
+                            <option value="rejected">Rejected</option>
+                            <option value="">All</option>
+                        </select>
+                    </div>
+                    <button id="refresh-btn" class="btn primary-btn" title="Refresh">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                            stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+            <div id="site-tabs" class="site-tabs"></div>
+        </header>
+
+        <main>
+            <div id="suggestions-list" class="suggestions-list"></div>
+            <p id="empty-state" class="empty-state hidden">No suggestions match the current filters.</p>
+        </main>
+    </div>
+
+    <!-- Edit Payload Modal -->
+    <div id="edit-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel">
+            <button class="close-modal-btn" id="edit-close-btn">&times;</button>
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3>Edit Payload</h3>
+                    <p class="modal-meta" id="edit-id"></p>
+                    <textarea id="edit-payload" class="json-editor" spellcheck="false"></textarea>
+                    <p id="edit-error" class="login-error"></p>
+                    <div class="modal-actions">
+                        <button id="edit-cancel-btn" class="btn secondary-btn">Cancel</button>
+                        <button id="edit-save-btn" class="btn primary-btn">Save</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Confirm Modal -->
+    <div id="confirm-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel confirm-modal-content">
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3 id="confirm-title">Confirm</h3>
+                    <p id="confirm-message"></p>
+                    <div class="modal-actions">
+                        <button id="confirm-cancel-btn" class="btn secondary-btn">Cancel</button>
+                        <button id="confirm-ok-btn" class="btn danger-btn">Confirm</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login Overlay -->
+    <div id="login-overlay" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel confirm-modal-content">
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3>Sign in</h3>
+                    <p class="modal-meta">Enter your API key to continue.</p>
+                    <input type="password" id="api-key-input" class="api-key-input" placeholder="API key"
+                        autocomplete="current-password">
+                    <p id="login-error" class="login-error"></p>
+                    <div class="modal-actions">
+                        <button id="login-submit-btn" class="btn primary-btn">Continue</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <script src="suggestions.js"></script>
+</body>
+
+</html>

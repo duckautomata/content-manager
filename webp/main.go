@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -45,6 +46,7 @@ func main() {
 	http.HandleFunc("/thumbnail", handleThumbnail) // Scale + WebP
 	http.HandleFunc("/bulk", handleBulk)           // Zip -> WebP Zip
 	http.HandleFunc("/slug", handleSlug)           // Generate slugs
+	http.HandleFunc("/formats", handleFormats)     // List supported input formats
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -298,6 +300,21 @@ func handleSlug(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// GET /formats - List supported input file extensions
+func handleFormats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	formats := make([]string, 0, len(supportedInputFormats))
+	for k := range supportedInputFormats {
+		formats = append(formats, k)
+	}
+	sort.Strings(formats)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"formats": formats})
 }
 
 // ---------------- Helpers ----------------

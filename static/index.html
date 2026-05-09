@@ -23,6 +23,7 @@
             <div class="header-content">
                 <h1>Content Manager</h1>
                 <div class="header-controls">
+                    <a href="suggestions.html" class="btn secondary-btn" title="Review suggestions">Suggestions</a>
                     <div class="prefix-selector">
                         <label for="prefix-input">Current Prefix:</label>
                         <input type="text" id="prefix-input" value="home/" placeholder="e.g. site1/">
@@ -145,6 +146,25 @@
                     <div class="modal-actions">
                         <button id="confirm-cancel-btn" class="btn secondary-btn">Cancel</button>
                         <button id="confirm-ok-btn" class="btn danger-btn">Confirm</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Login Overlay -->
+    <div id="login-overlay" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel confirm-modal-content">
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3>Sign in</h3>
+                    <p class="modal-meta">Enter your API key to continue.</p>
+                    <input type="password" id="api-key-input" class="api-key-input"
+                        placeholder="API key" autocomplete="current-password">
+                    <p id="login-error" class="login-error"></p>
+                    <div class="modal-actions">
+                        <button id="login-submit-btn" class="btn primary-btn">Continue</button>
                     </div>
                 </div>
             </div>

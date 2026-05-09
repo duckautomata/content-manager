@@ -1,3 +1,11 @@
+// Base path for API calls. Derived from the current page URL so the app works
+// when served under a subpath (e.g. domain.com/api/content-manager/).
+// Assumes the page URL ends with a "/" or with index.html — standard for index pages.
+const BASE_PATH = (() => {
+    const p = window.location.pathname;
+    return p.substring(0, p.lastIndexOf('/') + 1);
+})();
+
 const state = {
     prefix: new URLSearchParams(window.location.search).get('prefix') || 'home/',
     images: [],
@@ -51,10 +59,83 @@ const resultsList = document.getElementById('upload-results-list');
 const closeResultsBtn = document.querySelector('.close-results-btn');
 const resultsBackdrop = resultsModal.querySelector('.modal-backdrop');
 
+const loginOverlay = document.getElementById('login-overlay');
+const apiKeyInput = document.getElementById('api-key-input');
+const loginSubmitBtn = document.getElementById('login-submit-btn');
+const loginError = document.getElementById('login-error');
+
+// Auth
+const API_KEY_STORAGE = 'content_manager_api_key';
+
+function getApiKey() {
+    return localStorage.getItem(API_KEY_STORAGE);
+}
+
+function showLogin() {
+    apiKeyInput.value = '';
+    loginError.textContent = '';
+    loginOverlay.classList.remove('hidden');
+    setTimeout(() => apiKeyInput.focus(), 50);
+}
+
+function hideLogin() {
+    loginOverlay.classList.add('hidden');
+}
+
+async function apiFetch(url, options = {}) {
+    const key = getApiKey();
+    const headers = { ...(options.headers || {}) };
+    if (key) headers['X-API-KEY'] = key;
+    const res = await fetch(url, { ...options, headers });
+    if (res.status === 401) {
+        localStorage.removeItem(API_KEY_STORAGE);
+        showLogin();
+        throw new Error('Unauthorized');
+    }
+    return res;
+}
+
+loginSubmitBtn.addEventListener('click', async () => {
+    const key = apiKeyInput.value.trim();
+    if (!key) return;
+    loginError.textContent = '';
+    loginSubmitBtn.disabled = true;
+    try {
+        const res = await fetch(`${BASE_PATH}api/auth/check`, {
+            headers: { 'X-API-KEY': key }
+        });
+        if (res.ok) {
+            localStorage.setItem(API_KEY_STORAGE, key);
+            hideLogin();
+            fetchContent();
+        } else if (res.status === 401) {
+            loginError.textContent = 'Invalid API key.';
+        } else {
+            let detail = '';
+            try { detail = (await res.json()).detail || ''; } catch (_) { /* ignore */ }
+            loginError.textContent = detail
+                ? `Error (${res.status}): ${detail}`
+                : `Server error (${res.status}).`;
+        }
+    } catch (e) {
+        loginError.textContent = 'Network error. Try again.';
+    } finally {
+        loginSubmitBtn.disabled = false;
+    }
+});
+
+apiKeyInput.addEventListener('keypress', (e) => {
+    if (e.key === 'Enter') loginSubmitBtn.click();
+});
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     prefixInput.value = state.prefix;
-    fetchContent();
+    if (!getApiKey()) {
+        showLogin();
+    } else {
+        fetchContent();
+    }
 });
 
 // Toasts
@@ -205,7 +286,7 @@ replaceFileInput.addEventListener('change', async () => {
     progressFill.style.width = '50%';
 
     try {
-        const res = await fetch('/api/upload', {
+        const res = await apiFetch(`${BASE_PATH}api/upload`, {
             method: 'POST',
             body: formData
         });
@@ -260,7 +341,7 @@ function getPublicUrl(key) {
     }
     // Fallback if no public URL prefix is given, maybe the frontend endpoint itself is the proxy (though we don't serve R2 directly here)
     // Assuming bucket URLs or similar:
-    return `/api/content?key=${encodeURIComponent(key)}`; // Mock fallback
+    return `${BASE_PATH}api/content?key=${encodeURIComponent(key)}`; // Mock fallback
 }
 
 // Fetch State
@@ -271,7 +352,7 @@ async function fetchContent() {
     othersList.innerHTML = '';
 
     try {
-        const res = await fetch(`/api/content?prefix=${encodeURIComponent(state.prefix)}`);
+        const res = await apiFetch(`${BASE_PATH}api/content?prefix=${encodeURIComponent(state.prefix)}`);
         if (!res.ok) throw new Error('Failed to fetch content');
         const data = await res.json();
 
@@ -442,7 +523,7 @@ function openModal(img) {
 
         closeModal();
         try {
-            const res = await fetch('/api/content/bulk-delete', {
+            const res = await apiFetch(`${BASE_PATH}api/content/bulk-delete`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ keys }),
@@ -478,7 +559,7 @@ async function deleteItem(item) {
     });
     if (!ok) return;
     try {
-        const res = await fetch(`/api/content?key=${encodeURIComponent(item.key)}`, { method: 'DELETE' });
+        const res = await apiFetch(`${BASE_PATH}api/content?key=${encodeURIComponent(item.key)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Delete failed');
         toast(`Deleted ${item.filename}`, 'success');
         fetchContent();
@@ -506,7 +587,7 @@ async function handleFiles(files) {
             progressFill.style.width = `${((i) / files.length) * 100}%`;
             progressText.textContent = `Uploading ${i + 1} / ${files.length}: ${file.name}`;
 
-            const res = await fetch('/api/upload', {
+            const res = await apiFetch(`${BASE_PATH}api/upload`, {
                 method: 'POST',
                 body: formData
             });

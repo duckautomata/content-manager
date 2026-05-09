@@ -27,6 +27,8 @@ The content manager is the python part of the codebase. It is used to view, mana
 
 Its main part is the web interface. Here you can drag and drop files in, and set what prefix you want to work in.
 
+It also exposes a **public suggestion API** that lets external sites (e.g. dokimotes, dokinomicon) send in suggested content / data changes for admin review. See [Public Suggestion API](#public-suggestion-api).
+
 ### Image Converter
 
 The image converter is the golang part of the codebase located under the [webp/](/webp/) folder. It is used to extract info from the image and convert any image to webp.
@@ -120,3 +122,75 @@ To build a new image with the latest tag, run
 ```bash
 ./build.sh
 ```
+
+## Public Suggestion API
+
+The server hosts a small public API so external sites can suggest content changes. Suggestions are queued and reviewed by an admin at `/suggestions.html` before anything is published.
+
+### Endpoints
+
+All public endpoints require a Cloudflare Turnstile token. CORS is restricted to `https://www.duck-automata.com` (and localhost when `ENVIRONMENT=development`).
+
+| Method | Path                       | Body                                                                   | Returns                                          |
+|--------|----------------------------|------------------------------------------------------------------------|--------------------------------------------------|
+| GET    | `/api/public/config`       | —                                                                      | `{turnstile_site_key, allowed_sites, max_image_bytes, supported_formats, public_url_prefix, pending_prefix}` |
+| POST   | `/api/public/image`        | multipart: `cf_turnstile_response`, `file`                             | `{id, ext, urls: {original, preview, thumbnail}}` |
+| POST   | `/api/public/suggestion`   | json: `{cf_turnstile_response, site, kind, payload, image_ids}`        | `{id}` (201)                                     |
+
+**Suggestion `kind`:**
+- `new` — adding a new entity (e.g., a new emote)
+- `edit` — editing an existing entity (replace/remove images, change fields, etc.)
+- `delete` — requesting deletion of an entity
+
+**Storage layout:**
+
+```
+_suggestions/
+  {sug_id}.json                        # one file per suggestion
+  _pending/
+    {img_id}.{ext}                     # original (TTL'd 30d)
+    {img_id}_p.webp                    # preview
+    {img_id}_t.webp                    # thumbnail
+
+{site}/                                # live, no TTL
+  {img_id}.{ext}                       # moved here on suggestion approval
+  {img_id}_p.webp
+  {img_id}_t.webp
+```
+
+### R2 lifecycle rule
+
+Set a 30-day delete rule on the prefix `_suggestions/_pending/`. The suggestion JSON files (at `_suggestions/{id}.json`) will not match and stay forever as an audit trail. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days.
+
+### Cloudflare Turnstile setup
+
+1. Cloudflare dashboard → **Turnstile** → **Add site**.
+2. Domain: `duck-automata.com` (covers all subpaths).
+3. Widget mode: **Managed**.
+4. Save. Copy the **Site Key** (public) and **Secret Key** (server-only) into `.env`:
+   ```
+   TURNSTILE_SITE_KEY=...
+   TURNSTILE_SECRET_KEY=...
+   ```
+5. On the suggester site (e.g. dokimotes), add the widget script `https://challenges.cloudflare.com/turnstile/v0/api.js` and render with the site key. Submit the rendered token in the `cf_turnstile_response` field of the API request.
+6. In dev, leaving `TURNSTILE_SECRET_KEY` empty + `ENVIRONMENT=development` bypasses verification so you can test without the widget.
+
+### Cloudflare rate limiting
+
+Cloudflare dashboard → **Security → WAF → Rate limiting rules** → Create rule:
+- **Field**: URI Path, **Operator**: starts with, **Value**: `/api/public/`
+- **Rate**: e.g. 10 requests per 1 minute per IP
+- **Action**: Block (or Managed Challenge)
+
+### Admin endpoints (X-API-KEY required)
+
+| Method | Path                                                       | Purpose                                                  |
+|--------|------------------------------------------------------------|----------------------------------------------------------|
+| GET    | `/api/suggestions?site=&status=`                           | List suggestions (filter optional)                       |
+| GET    | `/api/suggestions/counts`                                  | `{site: {pending, approved, rejected}}` for tabs         |
+| GET    | `/api/suggestions/{id}`                                    | Get single suggestion                                    |
+| PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending)    |
+| PATCH  | `/api/suggestions/{id}/status`                             | `{status: "approved" \| "rejected"}` — approve moves images to live prefix |
+| DELETE | `/api/suggestions/{id}/images/{imgId}`                     | Reject one image (deletes pending files; only while suggestion is pending) |
+| DELETE | `/api/suggestions/{id}`                                    | Delete suggestion + non-approved pending images          |
+
