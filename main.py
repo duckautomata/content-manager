@@ -80,7 +80,14 @@ app = FastAPI(lifespan=lifespan)
 
 # ---------------- CORS ----------------
 
-cors_origins = ["https://www.duck-automata.com", "https://duck-automata.com"]
+cors_origins = [
+    "https://www.duck-automata.com",
+    "https://duck-automata.com",
+    "https://dev.duck-automata.com",
+]
+extra_cors = [o.strip() for o in os.environ.get("EXTRA_CORS_ORIGINS", "").split(",") if o.strip()]
+cors_origins.extend(extra_cors)
+
 cors_origin_regex: str | None = None
 if ENVIRONMENT == "development":
     cors_origin_regex = r"https?://(localhost|127\.0\.0\.1)(:\d+)?"
