@@ -801,9 +801,9 @@ async def reject_image(suggestion_id: str, image_id: str):
         )
     except Exception:
         # TTL will eventually clean these up if delete fails here.
-        logger.exception("Failed to delete rejected image files (non-fatal)")
+        logger.exception("Failed to delete removed image files (non-fatal)")
 
-    img["status"] = "rejected"
+    s["images"] = [i for i in s.get("images", []) if i.get("id") != image_id]
     await _write_suggestion(s)
     return s
 

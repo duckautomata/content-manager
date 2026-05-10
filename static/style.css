@@ -524,7 +524,8 @@ main {
     overflow-y: auto;
 }
 
-#modal-image {
+#modal-image,
+#image-modal-img {
     width: 100%;
     max-height: 60vh;
     object-fit: contain;
@@ -812,12 +813,29 @@ main {
 }
 
 .suggestion-kind {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.4rem;
     font-size: 0.75rem;
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    padding: 0.2rem 0.55rem;
+    padding: 0.2rem 0.6rem;
     border-radius: 999px;
+}
+
+.kind-prefix {
+    font-weight: 500;
+    opacity: 0.65;
+    font-size: 0.65rem;
+}
+
+.kind-prefix::after {
+    content: ':';
+}
+
+.kind-value {
+    font-weight: 800;
 }
 
 .kind-new {
@@ -935,6 +953,12 @@ main {
     overflow: hidden;
     border-radius: 6px;
     background: rgba(0, 0, 0, 0.2);
+    border: none;
+    padding: 0;
+    width: 100%;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
 }
 
 .image-tile-link img {

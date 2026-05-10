@@ -22,6 +22,17 @@ const statusFilter = document.getElementById('status-filter');
 const suggestionsList = document.getElementById('suggestions-list');
 const emptyState = document.getElementById('empty-state');
 
+const imageModal = document.getElementById('image-modal');
+const imageModalImg = document.getElementById('image-modal-img');
+const imageModalIdEl = document.getElementById('image-modal-id');
+const imageModalMeta = document.getElementById('image-modal-meta');
+const imageModalMoved = document.getElementById('image-modal-moved');
+const imageModalOriginal = document.getElementById('image-modal-original');
+const imageModalPreview = document.getElementById('image-modal-preview');
+const imageModalThumb = document.getElementById('image-modal-thumb');
+const imageModalRemove = document.getElementById('image-modal-remove');
+const imageModalCloseBtn = document.getElementById('image-modal-close-btn');
+
 const editModal = document.getElementById('edit-modal');
 const editPayload = document.getElementById('edit-payload');
 const editId = document.getElementById('edit-id');
@@ -278,6 +289,12 @@ function renderSuggestions() {
     }
 }
 
+const KIND_LABEL = {
+    new: 'add new entry',
+    edit: 'edit existing entry',
+    delete: 'delete existing entry',
+};
+
 function renderCard(s) {
     const card = document.createElement('section');
     card.className = `suggestion-card glass-panel status-${s.status}`;
@@ -285,13 +302,17 @@ function renderCard(s) {
 
     const isPending = s.status === 'pending';
     const submitted = s.submitted_at ? new Date(s.submitted_at).toLocaleString() : '';
+    const kindLabel = KIND_LABEL[s.kind] || s.kind;
 
     const head = document.createElement('div');
     head.className = 'suggestion-head';
     head.innerHTML = `
         <div class="suggestion-meta">
             <span class="suggestion-id">${s.id}</span>
-            <span class="suggestion-kind kind-${s.kind}">${s.kind}</span>
+            <span class="suggestion-kind kind-${s.kind}" title="What this suggestion is requesting">
+                <span class="kind-prefix">Suggests</span>
+                <span class="kind-value">${kindLabel}</span>
+            </span>
             <span class="suggestion-status status-pill status-${s.status}">${s.status}</span>
             <span class="suggestion-date">${submitted}</span>
         </div>
@@ -348,24 +369,75 @@ function renderImage(s, img) {
     const wrapper = document.createElement('div');
     wrapper.className = `image-tile status-${img.status}`;
     const previewUrl = imagePreviewUrl(s, img);
-    const originalUrl = imageOriginalUrl(s, img);
     const canReject = s.status === 'pending' && img.status === 'pending';
     wrapper.innerHTML = `
-        <a href="${originalUrl}" target="_blank" rel="noopener" class="image-tile-link">
+        <button type="button" class="image-tile-link" aria-label="Open ${img.id}">
             <img src="${previewUrl}" alt="${img.id}" loading="lazy"
                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🖼️</text></svg>'">
-        </a>
+        </button>
         <div class="image-tile-meta">
             <span class="image-id" title="${img.id}">${img.id}</span>
             <span class="status-pill status-${img.status}">${img.status}</span>
         </div>
         ${canReject ? `<button class="btn danger-btn small reject-image-btn">Remove</button>` : ''}
     `;
+    wrapper.querySelector('.image-tile-link').addEventListener('click', () => openImageModal(s, img));
     if (canReject) {
         wrapper.querySelector('.reject-image-btn').addEventListener('click', () => rejectImage(s, img));
     }
     return wrapper;
 }
+
+function imageThumbnailUrl(s, img) {
+    const base = state.publicUrlPrefix;
+    if (!base) return '';
+    if (img.status === 'approved' && img.moved_to) {
+        const movedBase = img.moved_to.replace(/\.[^.]+$/, '');
+        return `${base}/${movedBase}_t.webp`;
+    }
+    return `${base}/${state.pendingPrefix}${img.id}_t.webp`;
+}
+
+function openImageModal(s, img) {
+    const previewUrl = imagePreviewUrl(s, img);
+    const originalUrl = imageOriginalUrl(s, img);
+    const thumbUrl = imageThumbnailUrl(s, img);
+
+    imageModalImg.src = previewUrl;
+    imageModalImg.alt = img.id;
+    imageModalIdEl.textContent = img.id;
+
+    const metaParts = [
+        `Ext: ${img.ext}`,
+        `Status: ${img.status}`,
+        `Suggestion: ${s.id}`,
+    ];
+    imageModalMeta.textContent = metaParts.join(' • ');
+    imageModalMoved.textContent = img.moved_to ? `Moved to: ${img.moved_to}` : '';
+
+    imageModalOriginal.href = originalUrl || '#';
+    imageModalPreview.href = previewUrl || '#';
+    imageModalThumb.href = thumbUrl || '#';
+
+    const canReject = s.status === 'pending' && img.status === 'pending';
+    imageModalRemove.style.display = canReject ? 'inline-flex' : 'none';
+    imageModalRemove.onclick = canReject
+        ? async () => {
+            closeImageModal();
+            await rejectImage(s, img);
+        }
+        : null;
+
+    imageModal.classList.remove('hidden');
+}
+
+function closeImageModal() {
+    imageModal.classList.add('hidden');
+    imageModalImg.src = '';
+}
+
+imageModalCloseBtn.addEventListener('click', closeImageModal);
+imageModal.querySelector('.modal-backdrop').addEventListener('click', closeImageModal);
 
 function escapeHtml(str) {
     return str.replace(/[&<>"']/g, c => ({
@@ -522,7 +594,9 @@ editSaveBtn.addEventListener('click', async () => {
 });
 
 document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && !editModal.classList.contains('hidden')) closeEditModal();
+    if (e.key !== 'Escape') return;
+    if (!editModal.classList.contains('hidden')) closeEditModal();
+    else if (!imageModal.classList.contains('hidden')) closeImageModal();
 });
 
 // ---------------- Filters ----------------
