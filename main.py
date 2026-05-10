@@ -44,6 +44,10 @@ MAX_PUBLIC_UPLOAD_BYTES = 25 * 1024 * 1024
 SUGGESTIONS_PREFIX = "_suggestions/"
 PENDING_PREFIX = "_suggestions/_pending/"
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+# Cloudflare's published always-pass test pair, used when a localhost origin is opted in via EXTRA_CORS_ORIGINS.
+TURNSTILE_TEST_SITE_KEY = "1x00000000000000000000AA"
+TURNSTILE_TEST_SECRET_KEY = "1x0000000000000000000000000000000AA"
+_LOCALHOST_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 
 SUPPORTED_FORMATS_FALLBACK = frozenset({
     "jpg", "jpeg", "png", "apng", "gif", "webp", "avif", "heic", "heif",
@@ -301,15 +305,30 @@ def _client_ip(request: Request) -> str | None:
     )
 
 
-async def verify_turnstile(token: str | None, remote_ip: str | None = None) -> None:
-    if not TURNSTILE_SECRET_KEY:
+def _use_test_turnstile(request: Request) -> bool:
+    """Localhost origins explicitly opted into EXTRA_CORS_ORIGINS use the always-pass test key pair,
+    so devs can exercise the real widget locally without the prod site key (which is hostname-bound)."""
+    origin = request.headers.get("Origin")
+    if not origin or not _LOCALHOST_ORIGIN_RE.match(origin):
+        return False
+    return origin in extra_cors
+
+
+async def verify_turnstile(
+    token: str | None,
+    remote_ip: str | None = None,
+    *,
+    use_test_keys: bool = False,
+) -> None:
+    secret = TURNSTILE_TEST_SECRET_KEY if use_test_keys else TURNSTILE_SECRET_KEY
+    if not secret:
         if ENVIRONMENT == "development":
             logger.info("Turnstile bypass: ENVIRONMENT=development and no secret configured")
             return
         raise HTTPException(status_code=500, detail="Turnstile not configured")
     if not token:
         raise HTTPException(status_code=400, detail="Missing Turnstile token")
-    data = {"secret": TURNSTILE_SECRET_KEY, "response": token}
+    data = {"secret": secret, "response": token}
     if remote_ip:
         data["remoteip"] = remote_ip
     try:
@@ -527,9 +546,10 @@ async def bulk_delete_content(req: BulkDeleteRequest):
 # ---------------- Public endpoints ----------------
 
 @app.get("/api/public/config")
-async def public_config():
+async def public_config(request: Request):
+    site_key = TURNSTILE_TEST_SITE_KEY if _use_test_turnstile(request) else TURNSTILE_SITE_KEY
     return {
-        "turnstile_site_key": TURNSTILE_SITE_KEY,
+        "turnstile_site_key": site_key,
         "allowed_sites": ALLOWED_SITES,
         "max_image_bytes": MAX_PUBLIC_UPLOAD_BYTES,
         "supported_formats": sorted(SUPPORTED_FORMATS),
@@ -544,7 +564,10 @@ async def public_upload_image(
     cf_turnstile_response: str = Form(...),
     file: UploadFile = File(...),
 ):
-    await verify_turnstile(cf_turnstile_response, _client_ip(request))
+    await verify_turnstile(
+        cf_turnstile_response, _client_ip(request),
+        use_test_keys=_use_test_turnstile(request),
+    )
 
     content = await file.read()
     if not content:
@@ -586,7 +609,10 @@ async def public_upload_image(
 
 @app.post("/api/public/suggestion", status_code=201)
 async def public_submit_suggestion(req: PublicSuggestionRequest, request: Request):
-    await verify_turnstile(req.cf_turnstile_response, _client_ip(request))
+    await verify_turnstile(
+        req.cf_turnstile_response, _client_ip(request),
+        use_test_keys=_use_test_turnstile(request),
+    )
 
     if req.site not in ALLOWED_SITES:
         raise HTTPException(status_code=400, detail=f"Unknown site: {req.site}")
