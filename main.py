@@ -35,6 +35,7 @@ PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")
 API_KEY = os.environ.get("API_KEY")
 
 ALLOWED_SITES = [s.strip() for s in os.environ.get("ALLOWED_SITES", "").split(",") if s.strip()]
+TURNSTILE_ENABLED = os.environ.get("TURNSTILE_ENABLED", "true").strip().lower() in ("true", "1", "yes", "on")
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY")
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
@@ -59,6 +60,8 @@ if not API_KEY:
     logger.warning("API_KEY not set. All admin API requests will be rejected.")
 if not ALLOWED_SITES:
     logger.warning("ALLOWED_SITES not set. Public suggestion API will reject all submissions.")
+if not TURNSTILE_ENABLED:
+    logger.warning("TURNSTILE_ENABLED=false. Public endpoints will accept any request without captcha verification.")
 
 
 # ---------------- Lifespan ----------------
@@ -320,6 +323,8 @@ async def verify_turnstile(
     *,
     use_test_keys: bool = False,
 ) -> None:
+    if not TURNSTILE_ENABLED:
+        return
     secret = TURNSTILE_TEST_SECRET_KEY if use_test_keys else TURNSTILE_SECRET_KEY
     if not secret:
         if ENVIRONMENT == "development":
@@ -549,7 +554,8 @@ async def bulk_delete_content(req: BulkDeleteRequest):
 async def public_config(request: Request):
     site_key = TURNSTILE_TEST_SITE_KEY if _use_test_turnstile(request) else TURNSTILE_SITE_KEY
     return {
-        "turnstile_site_key": site_key,
+        "turnstile_enabled": TURNSTILE_ENABLED,
+        "turnstile_site_key": site_key if TURNSTILE_ENABLED else "",
         "allowed_sites": ALLOWED_SITES,
         "max_image_bytes": MAX_PUBLIC_UPLOAD_BYTES,
         "supported_formats": sorted(SUPPORTED_FORMATS),
