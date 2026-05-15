@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -372,6 +373,11 @@ async def verify_turnstile(
 
 _upload_counter: dict[str, int] = {}
 _upload_counter_lock = asyncio.Lock()
+_ip_hash_salt = secrets.token_bytes(16)
+
+
+def _hash_ip(ip: str) -> str:
+    return hashlib.sha256(_ip_hash_salt + ip.encode("utf-8")).hexdigest()[:12]
 
 
 def _format_window(seconds: int) -> str:
@@ -385,7 +391,7 @@ def _format_window(seconds: int) -> str:
 async def _record_image_upload(ip: str | None) -> None:
     if IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS <= 0 or not DISCORD_WEBHOOK:
         return
-    key = ip or "unknown"
+    key = _hash_ip(ip) if ip else "unknown"
     async with _upload_counter_lock:
         _upload_counter[key] = _upload_counter.get(key, 0) + 1
 
@@ -399,7 +405,7 @@ async def _flush_upload_counter() -> None:
 
     total = sum(snapshot.values())
     top = sorted(snapshot.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    breakdown = "\n".join(f"`{ip}` — {count}" for ip, count in top)
+    breakdown = "\n".join(f"`{client}` — {count}" for client, count in top)
     if len(snapshot) > len(top):
         breakdown += f"\n... and {len(snapshot) - len(top)} more"
 
@@ -408,9 +414,9 @@ async def _flush_upload_counter() -> None:
         "color": 0x57F287,
         "description": (
             f"{total} upload(s) in the last {_format_window(IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS)} "
-            f"from {len(snapshot)} unique IP(s)."
+            f"from {len(snapshot)} unique client(s)."
         ),
-        "fields": [{"name": "By IP", "value": breakdown}],
+        "fields": [{"name": "Top clients (hashed)", "value": breakdown}],
     }
     try:
         async with httpx.AsyncClient() as client:
