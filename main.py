@@ -473,7 +473,7 @@ class BulkDeleteRequest(BaseModel):
 
 
 class PublicSuggestionRequest(BaseModel):
-    cf_turnstile_response: str
+    cf_turnstile_response: str = ""
     site: str
     kind: Literal["new", "edit", "delete"]
     payload: dict = Field(default_factory=dict)
@@ -646,7 +646,7 @@ async def public_config(request: Request):
 @app.post("/api/public/image")
 async def public_upload_image(
     request: Request,
-    cf_turnstile_response: str = Form(...),
+    cf_turnstile_response: str = Form(""),
     file: UploadFile = File(...),
 ):
     await verify_turnstile(
