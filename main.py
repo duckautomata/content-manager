@@ -38,8 +38,9 @@ ALLOWED_SITES = [s.strip() for s in os.environ.get("ALLOWED_SITES", "").split(",
 TURNSTILE_ENABLED = os.environ.get("TURNSTILE_ENABLED", "true").strip().lower() in ("true", "1", "yes", "on")
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY")
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 ADMIN_URL = os.environ.get("ADMIN_URL", "")
+IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS = int(os.environ.get("IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS", "600"))
 
 MAX_PUBLIC_UPLOAD_BYTES = 25 * 1024 * 1024
 SUGGESTIONS_PREFIX = "_suggestions/"
@@ -79,7 +80,25 @@ async def lifespan(app: FastAPI):
                 logger.info("Loaded %d supported formats from conversion service", len(formats))
     except Exception:
         logger.warning("Could not fetch /formats from conversion service; using fallback list")
-    yield
+
+    rollup_task: asyncio.Task | None = None
+    if IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS > 0 and DISCORD_WEBHOOK:
+        rollup_task = asyncio.create_task(_upload_rollup_loop())
+        logger.info(
+            "Image upload rollup enabled, interval=%ds",
+            IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS,
+        )
+
+    try:
+        yield
+    finally:
+        if rollup_task is not None:
+            rollup_task.cancel()
+            try:
+                await rollup_task
+            except asyncio.CancelledError:
+                pass
+            await _flush_upload_counter()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -351,6 +370,66 @@ async def verify_turnstile(
 
 # ---------------- Discord ----------------
 
+_upload_counter: dict[str, int] = {}
+_upload_counter_lock = asyncio.Lock()
+
+
+def _format_window(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds % 60 == 0:
+        return f"{seconds // 60} min"
+    return f"{seconds / 60:.1f} min"
+
+
+async def _record_image_upload(ip: str | None) -> None:
+    if IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS <= 0 or not DISCORD_WEBHOOK:
+        return
+    key = ip or "unknown"
+    async with _upload_counter_lock:
+        _upload_counter[key] = _upload_counter.get(key, 0) + 1
+
+
+async def _flush_upload_counter() -> None:
+    async with _upload_counter_lock:
+        if not _upload_counter:
+            return
+        snapshot = dict(_upload_counter)
+        _upload_counter.clear()
+
+    total = sum(snapshot.values())
+    top = sorted(snapshot.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    breakdown = "\n".join(f"`{ip}` — {count}" for ip, count in top)
+    if len(snapshot) > len(top):
+        breakdown += f"\n... and {len(snapshot) - len(top)} more"
+
+    embed = {
+        "title": "Image upload activity",
+        "color": 0x57F287,
+        "description": (
+            f"{total} upload(s) in the last {_format_window(IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS)} "
+            f"from {len(snapshot)} unique IP(s)."
+        ),
+        "fields": [{"name": "By IP", "value": breakdown}],
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+    except Exception:
+        logger.exception("Discord upload rollup delivery failed")
+
+
+async def _upload_rollup_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS)
+            await _flush_upload_counter()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Upload rollup loop iteration failed")
+
+
 async def _notify_discord(suggestion: dict, sample_image_url: str | None) -> None:
     if not DISCORD_WEBHOOK:
         return
@@ -601,6 +680,7 @@ async def public_upload_image(
         content=content, mime=mime, original_ext=ext_with_dot,
         original_name=file_name, prefix=PENDING_PREFIX,
     )
+    await _record_image_upload(_client_ip(request))
     base = PUBLIC_URL_PREFIX.rstrip("/")
     return {
         "id": result["slug"],
