@@ -51,6 +51,7 @@ const toastContainer = document.getElementById('toast-container');
 const modalOrigLink = document.getElementById('modal-original-link');
 const modalPrevLink = document.getElementById('modal-preview-link');
 const modalDelBtn = document.getElementById('modal-delete-btn');
+const modalCopyIdBtn = document.getElementById('modal-copy-id-btn');
 const closeBtn = document.querySelector('.close-modal-btn');
 const backdrop = document.querySelector('.modal-backdrop');
 
@@ -182,6 +183,37 @@ function confirmAction({ title = 'Confirm', message = '', confirmText = 'Confirm
         confirmModal.classList.remove('hidden');
         confirmOkBtn.focus();
     });
+}
+
+function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+async function copyToClipboard(text) {
+    try {
+        if (navigator.clipboard) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (_) { /* fall through to legacy path */ }
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.top = '0';
+        ta.style.left = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        return true;
+    } catch (e) {
+        console.error('Copy failed', e);
+        return false;
+    }
 }
 
 function formatBytes(bytes) {
@@ -371,105 +403,118 @@ async function fetchContent() {
 }
 
 // Render UI
+const RENDER_BATCH = 60;
+let _renderObservers = [];
+
+function clearRenderObservers() {
+    _renderObservers.forEach(o => o.disconnect());
+    _renderObservers = [];
+}
+
+// Render `items` into `container` in batches, revealing more as a sentinel
+// scrolls into view. Keeps the DOM light even for very large prefixes.
+function renderIncrementally(container, items, createNode) {
+    let i = 0;
+    const sentinel = document.createElement('div');
+    sentinel.className = 'render-sentinel';
+    sentinel.style.minHeight = '1px';
+
+    const renderNext = () => {
+        const frag = document.createDocumentFragment();
+        const end = Math.min(i + RENDER_BATCH, items.length);
+        for (; i < end; i++) frag.appendChild(createNode(items[i]));
+        container.appendChild(frag);
+        if (i < items.length) {
+            container.appendChild(sentinel); // keep the sentinel after the last card
+        } else {
+            obs.disconnect();
+            sentinel.remove();
+        }
+    };
+
+    const obs = new IntersectionObserver((entries) => {
+        if (entries.some(e => e.isIntersecting)) renderNext();
+    }, { rootMargin: '300px' });
+
+    renderNext();
+    if (i < items.length) obs.observe(sentinel);
+    _renderObservers.push(obs);
+}
+
+function createMediaCard(item, fallbackEmoji) {
+    const thumbKey = item.files.thumbnail || item.files.original; // Fallback to original if no thumb somehow
+    const url = getPublicUrl(state.prefix + thumbKey);
+
+    const card = document.createElement('div');
+    card.className = 'image-card glass-panel';
+    card.innerHTML = `
+        <img src="${escapeHtml(url)}" alt="${escapeHtml(item.slug)}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>${fallbackEmoji}</text></svg>'">
+        <div class="overlay">
+            <span>${escapeHtml(item.slug)}</span>
+        </div>
+    `;
+    card.addEventListener('click', () => openModal(item));
+    return card;
+}
+
+function createOtherItem(item) {
+    const div = document.createElement('div');
+    div.className = 'list-item';
+
+    const size = formatBytes(item.size);
+    const date = formatDate(item.last_modified);
+
+    div.innerHTML = `
+        <div class="item-info">
+            <svg class="item-icon" viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
+            <div class="item-details">
+                <div class="item-name">${escapeHtml(item.filename)}</div>
+                <div class="item-meta">
+                    <span>${size}</span>
+                    <span>${date}</span>
+                </div>
+            </div>
+        </div>
+        <div class="item-actions">
+            <button class="btn secondary-btn replace-item-btn" title="Replace File">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.3-11.23l4.63 4.66"/></svg>
+            </button>
+            <a href="${escapeHtml(getPublicUrl(item.key))}" target="_blank" class="btn secondary-btn" title="Download">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+            </a>
+            <button class="btn danger-btn delete-item-btn" data-key="${escapeHtml(item.key)}" title="Delete">
+                <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            </button>
+        </div>
+    `;
+
+    div.querySelector('.replace-item-btn').addEventListener('click', () => {
+        currentReplaceFilename = item.filename;
+        replaceFileInput.click();
+    });
+    div.querySelector('.delete-item-btn').addEventListener('click', () => deleteItem(item));
+
+    return div;
+}
+
 function renderContent() {
+    clearRenderObservers();
     imagesGrid.innerHTML = '';
     videosGrid.innerHTML = '';
     othersList.innerHTML = '';
 
-    let imageMatchCount = 0;
-    // Images
-    state.images.forEach(img => {
-        if (state.filter && !img.slug.toLowerCase().includes(state.filter)) return;
-        imageMatchCount++;
+    const f = state.filter;
+    const imgs = f ? state.images.filter(i => i.slug.toLowerCase().includes(f)) : state.images;
+    const vids = f ? state.videos.filter(v => v.slug.toLowerCase().includes(f)) : state.videos;
+    const others = f ? state.others.filter(o => o.filename.toLowerCase().includes(f)) : state.others;
 
-        const thumbKey = img.files.thumbnail || img.files.original; // Fallback to original if no thumb somehow
-        const url = getPublicUrl(state.prefix + thumbKey);
+    imagesCount.textContent = imgs.length;
+    videosCount.textContent = vids.length;
+    othersCount.textContent = others.length;
 
-        const card = document.createElement('div');
-        card.className = 'image-card glass-panel';
-        card.innerHTML = `
-            <img src="${url}" alt="${img.slug}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🖼️</text></svg>'">
-            <div class="overlay">
-                <span>${img.slug}</span>
-            </div>
-        `;
-
-        card.addEventListener('click', () => openModal(img));
-        imagesGrid.appendChild(card);
-    });
-    imagesCount.textContent = imageMatchCount;
-
-    let videoMatchCount = 0;
-    // Videos
-    state.videos.forEach(vid => {
-        if (state.filter && !vid.slug.toLowerCase().includes(state.filter)) return;
-        videoMatchCount++;
-
-        const thumbKey = vid.files.thumbnail || vid.files.original; // Fallback to original if no thumb somehow
-        const url = getPublicUrl(state.prefix + thumbKey);
-
-        const card = document.createElement('div');
-        card.className = 'image-card glass-panel';
-        card.innerHTML = `
-            <img src="${url}" alt="${vid.slug}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎥</text></svg>'">
-            <div class="overlay">
-                <span>${vid.slug}</span>
-            </div>
-        `;
-
-        card.addEventListener('click', () => openModal(vid));
-        videosGrid.appendChild(card);
-    });
-    videosCount.textContent = videoMatchCount;
-
-    let othersMatchCount = 0;
-    // Others
-    state.others.forEach(item => {
-        if (state.filter && !item.filename.toLowerCase().includes(state.filter)) return;
-        othersMatchCount++;
-
-        const div = document.createElement('div');
-        div.className = 'list-item';
-
-        const sizeMb = (item.size / (1024 * 1024)).toFixed(2);
-        const date = new Date(item.last_modified).toLocaleDateString();
-
-        div.innerHTML = `
-            <div class="item-info">
-                <svg class="item-icon" viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><polyline points="13 2 13 9 20 9"></polyline></svg>
-                <div class="item-details">
-                    <div class="item-name">${item.filename}</div>
-                    <div class="item-meta">
-                        <span>${sizeMb} MB</span>
-                        <span>${date}</span>
-                    </div>
-                </div>
-            </div>
-            <div class="item-actions">
-                <button class="btn secondary-btn replace-item-btn" title="Replace File">
-                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.3-11.23l4.63 4.66"/></svg>
-                </button>
-                <a href="${getPublicUrl(item.key)}" target="_blank" class="btn secondary-btn" title="Download">
-                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                </a>
-                <button class="btn danger-btn delete-item-btn" data-key="${item.key}" title="Delete">
-                    <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                </button>
-            </div>
-        `;
-
-        const replaceBtn = div.querySelector('.replace-item-btn');
-        replaceBtn.addEventListener('click', () => {
-            currentReplaceFilename = item.filename;
-            replaceFileInput.click();
-        });
-
-        const delBtn = div.querySelector('.delete-item-btn');
-        delBtn.addEventListener('click', () => deleteItem(item));
-
-        othersList.appendChild(div);
-    });
-    othersCount.textContent = othersMatchCount;
+    renderIncrementally(imagesGrid, imgs, (it) => createMediaCard(it, '🖼️'));
+    renderIncrementally(videosGrid, vids, (it) => createMediaCard(it, '🎥'));
+    renderIncrementally(othersList, others, createOtherItem);
 }
 
 // Modal Functions
@@ -501,6 +546,11 @@ function openModal(img) {
         }
     };
     modalTitle.textContent = img.slug;
+
+    modalCopyIdBtn.onclick = async () => {
+        const ok = await copyToClipboard(img.slug);
+        toast(ok ? `Copied ${img.slug}` : 'Copy failed', ok ? 'success' : 'error');
+    };
 
     modalOrigLink.href = getPublicUrl(state.prefix + origKey);
     modalOrigLink.style.display = img.files.original ? 'inline-flex' : 'none';
@@ -651,31 +701,31 @@ function showUploadResults(results) {
             div.style.border = '1px solid var(--danger)';
             div.style.background = 'rgba(239, 68, 68, 0.1)';
             div.innerHTML = `
-                <strong style="color: var(--danger); display:block; margin-bottom:0.5rem;">Failed to upload <span>${res.original_name}</span></strong>
+                <strong style="color: var(--danger); display:block; margin-bottom:0.5rem;">Failed to upload <span>${escapeHtml(res.original_name)}</span></strong>
                 <div style="font-size: 0.85rem; color: var(--text-muted);">
-                    <div><span style="color:var(--text-main);">Error:</span> ${res.error_message}</div>
+                    <div><span style="color:var(--text-main);">Error:</span> ${escapeHtml(res.error_message)}</div>
                 </div>
             `;
         } else if (res.type === 'image' || res.type === 'video') {
             div.innerHTML = `
                 <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:0.5rem;">
-                    <strong style="color: var(--primary);">${res.slug}</strong>
-                    <button class="btn secondary-btn copy-id-btn" data-id="${res.slug}" title="Copy ID" style="padding: 0.25rem 0.5rem;">
+                    <strong style="color: var(--primary);">${escapeHtml(res.slug)}</strong>
+                    <button class="btn secondary-btn copy-id-btn" data-id="${escapeHtml(res.slug)}" title="Copy ID" style="padding: 0.25rem 0.5rem;">
                         <svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                     </button>
                 </div>
                 <div style="font-size: 0.85rem; color: var(--text-muted); display:flex; flex-direction:column; gap:0.25rem;">
-                    <div><span style="color:var(--text-main);">Original:</span> ${res.original_name} -> ${res.original}</div>
-                    <div><span style="color:var(--text-main);">Preview:</span> ${res.preview}</div>
-                    <div><span style="color:var(--text-main);">Thumbnail:</span> ${res.thumbnail}</div>
+                    <div><span style="color:var(--text-main);">Original:</span> ${escapeHtml(res.original_name)} -> ${escapeHtml(res.original)}</div>
+                    <div><span style="color:var(--text-main);">Preview:</span> ${escapeHtml(res.preview)}</div>
+                    <div><span style="color:var(--text-main);">Thumbnail:</span> ${escapeHtml(res.thumbnail)}</div>
                 </div>
             `;
         } else {
             const displayName = res.original_name ? res.original_name : res.key.split('/').pop();
             div.innerHTML = `
-                <strong style="color: var(--accent-1); display:block; margin-bottom:0.5rem;">${displayName}</strong>
+                <strong style="color: var(--accent-1); display:block; margin-bottom:0.5rem;">${escapeHtml(displayName)}</strong>
                 <div style="font-size: 0.85rem; color: var(--text-muted);">
-                    <div><span style="color:var(--text-main);">Path:</span> ${res.key}</div>
+                    <div><span style="color:var(--text-main);">Path:</span> ${escapeHtml(res.key)}</div>
                 </div>
             `;
         }

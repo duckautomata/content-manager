@@ -11,6 +11,8 @@ const state = {
     focusId: params.get('id') || null,
     counts: {},
     suggestions: [],
+    total: 0,
+    truncated: false,
     publicUrlPrefix: '',
     pendingPrefix: '_suggestions/_pending/',
 };
@@ -194,6 +196,8 @@ async function loadCounts() {
 async function loadSuggestions() {
     if (!state.site) {
         state.suggestions = [];
+        state.total = 0;
+        state.truncated = false;
         return;
     }
     const url = new URL(`${BASE_PATH}api/suggestions`, window.location.origin);
@@ -203,6 +207,8 @@ async function loadSuggestions() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.suggestions = data.suggestions || [];
+    state.total = data.total ?? state.suggestions.length;
+    state.truncated = !!data.truncated;
 }
 
 async function refresh() {
@@ -274,6 +280,13 @@ function renderSuggestions() {
         return;
     }
     emptyState.classList.add('hidden');
+
+    if (state.truncated) {
+        const note = document.createElement('p');
+        note.className = 'muted truncation-note';
+        note.textContent = `Showing the newest ${state.suggestions.length} of ${state.total}. Narrow by status to see older entries.`;
+        suggestionsList.appendChild(note);
+    }
 
     for (const s of state.suggestions) {
         suggestionsList.appendChild(renderCard(s));

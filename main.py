@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
 
@@ -31,6 +31,7 @@ R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+S3_CONFIGURED = all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME])
 CONVERSION_SERVICE_URL = os.environ.get("CONVERSION_SERVICE_URL", "http://webp-converter:8090")
 PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")
 API_KEY = os.environ.get("API_KEY")
@@ -44,6 +45,9 @@ ADMIN_URL = os.environ.get("ADMIN_URL", "")
 IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS = int(os.environ.get("IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS", "600"))
 
 MAX_PUBLIC_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_PUBLIC_PAYLOAD_BYTES = 10 * 1024 * 1024
+MAX_SUGGESTION_IMAGE_IDS = 1000
+SUGGESTIONS_PAGE_LIMIT = 200
 SUGGESTIONS_PREFIX = "_suggestions/"
 PENDING_PREFIX = "_suggestions/_pending/"
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -81,6 +85,14 @@ async def lifespan(app: FastAPI):
                 logger.info("Loaded %d supported formats from conversion service", len(formats))
     except Exception:
         logger.warning("Could not fetch /formats from conversion service; using fallback list")
+
+    if S3_CONFIGURED:
+        try:
+            migrated = await asyncio.to_thread(_migrate_legacy_suggestions_sync)
+            if migrated:
+                logger.info("Migrated %d legacy suggestion(s) to site/status layout", migrated)
+        except Exception:
+            logger.exception("Legacy suggestion migration failed")
 
     rollup_task: asyncio.Task | None = None
     if IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS > 0 and DISCORD_WEBHOOK:
@@ -143,9 +155,8 @@ def require_api_key(x_api_key: str | None = Header(default=None)):
 # ---------------- S3 client ----------------
 
 def get_s3_client():
-    if not all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME]):
+    if not S3_CONFIGURED:
         logger.warning("R2 credentials missing. S3 operations will fail.")
-        os.close(1)
     return boto3.client(
         "s3",
         endpoint_url=R2_ENDPOINT_URL,
@@ -252,59 +263,166 @@ def _validate_id(value: str, kind: str) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid {kind} id")
 
 
-def _suggestion_key(suggestion_id: str) -> str:
-    return f"{SUGGESTIONS_PREFIX}{suggestion_id}.json"
+_SUGGESTION_STATUSES = ("pending", "approved", "rejected")
 
 
-def _read_suggestion_sync(suggestion_id: str) -> dict | None:
+def _suggestion_object_key(s: dict) -> str:
+    """Storage key encodes site/status/submitted_at so counts and newest-first
+    ordering come from listing keys alone, without reading object bodies.
+    Layout: _suggestions/{site}/{status}/{submitted_at}__{id}.json"""
+    return f"{SUGGESTIONS_PREFIX}{s['site']}/{s['status']}/{s['submitted_at']}__{s['id']}.json"
+
+
+def _is_suggestion_key(key: str) -> bool:
+    """True for a nested suggestion object, excluding the _pending/ image area."""
+    if key.startswith(PENDING_PREFIX) or not key.endswith(".json"):
+        return False
+    return len(key[len(SUGGESTIONS_PREFIX):].split("/")) == 3
+
+
+def _locate_suggestion_key_sync(suggestion_id: str) -> str | None:
+    """Find a suggestion's current key by scanning keys only (no body reads)."""
+    paginator = s3.get_paginator("list_objects_v2")
+    suffix = f"__{suggestion_id}.json"
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SUGGESTIONS_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.startswith(PENDING_PREFIX):
+                continue
+            if key.endswith(suffix):
+                return key
+    return None
+
+
+def _read_suggestion_sync(suggestion_id: str) -> tuple[dict, str] | None:
+    """Return (suggestion, current_key) or None. Callers need the key to move/delete."""
+    key = _locate_suggestion_key_sync(suggestion_id)
+    if not key:
+        return None
     try:
-        resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=_suggestion_key(suggestion_id))
-        return json.loads(resp["Body"].read())
+        resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
     except ClientError as e:
         if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
             return None
         raise
+    return json.loads(resp["Body"].read()), key
 
 
-async def _read_suggestion(suggestion_id: str) -> dict | None:
+async def _read_suggestion(suggestion_id: str) -> tuple[dict, str] | None:
     return await asyncio.to_thread(_read_suggestion_sync, suggestion_id)
 
 
-async def _write_suggestion(suggestion: dict) -> None:
+async def _write_suggestion(suggestion: dict, *, old_key: str | None = None) -> None:
+    """Write the suggestion at its computed key. If the key changed (site/status
+    moved), pass old_key to remove the previous object."""
+    new_key = _suggestion_object_key(suggestion)
     body = json.dumps(suggestion).encode("utf-8")
     await asyncio.to_thread(
         s3.put_object,
         Bucket=R2_BUCKET_NAME,
-        Key=_suggestion_key(suggestion["id"]),
+        Key=new_key,
         Body=body,
         ContentType="application/json",
     )
+    if old_key and old_key != new_key:
+        try:
+            await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=old_key)
+        except Exception:
+            logger.exception("Failed to remove stale suggestion key %s after move", old_key)
 
 
-def _list_suggestion_keys_sync() -> list[str]:
+def _count_suggestions_sync() -> dict[str, dict[str, int]]:
+    """Tally pending/approved/rejected per site from key listing only."""
+    counts: dict[str, dict[str, int]] = {}
     paginator = s3.get_paginator("list_objects_v2")
-    keys: list[str] = []
-    # Delimiter="/" prevents recursion into _pending/
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SUGGESTIONS_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not _is_suggestion_key(key):
+                continue
+            site, status, _ = key[len(SUGGESTIONS_PREFIX):].split("/")
+            bucket = counts.setdefault(site, {st: 0 for st in _SUGGESTION_STATUSES})
+            if status in bucket:
+                bucket[status] += 1
+    return counts
+
+
+def _list_suggestions_sync(
+    site: str | None, status: str | None, limit: int
+) -> tuple[list[dict], int]:
+    """Newest-first suggestions for the given filters. Returns (page, total).
+    Ordering and total come from keys; only the returned page's bodies are read."""
+    if site and status:
+        prefix = f"{SUGGESTIONS_PREFIX}{site}/{status}/"
+    elif site:
+        prefix = f"{SUGGESTIONS_PREFIX}{site}/"
+    else:
+        prefix = SUGGESTIONS_PREFIX
+
+    paginator = s3.get_paginator("list_objects_v2")
+    basenames: list[tuple[str, str]] = []  # (basename, full_key); basename starts with submitted_at
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not _is_suggestion_key(key):
+                continue
+            parts = key[len(SUGGESTIONS_PREFIX):].split("/")
+            if status and parts[1] != status:
+                continue
+            basenames.append((parts[2], key))
+
+    total = len(basenames)
+    basenames.sort(key=lambda e: e[0], reverse=True)
+    page_keys = [k for _, k in basenames[:limit]]
+
+    suggestions: list[dict] = []
+    for k in page_keys:
+        try:
+            resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=k)
+            suggestions.append(json.loads(resp["Body"].read()))
+        except Exception:
+            logger.exception("Failed to read suggestion %s", k)
+    return suggestions, total
+
+
+def _migrate_legacy_suggestions_sync() -> int:
+    """Move legacy flat-layout suggestions (_suggestions/{id}.json) into the
+    site/status nested layout. Idempotent; returns the number migrated."""
+    paginator = s3.get_paginator("list_objects_v2")
+    legacy: list[tuple[str, str]] = []
+    # Delimiter="/" returns only objects directly under _suggestions/ (the legacy ones);
+    # nested {site}/ and _pending/ show up as CommonPrefixes, not Contents.
     for page in paginator.paginate(
         Bucket=R2_BUCKET_NAME, Prefix=SUGGESTIONS_PREFIX, Delimiter="/"
     ):
         for obj in page.get("Contents", []):
-            if obj["Key"].endswith(".json"):
-                keys.append(obj["Key"])
-    return keys
+            key = obj["Key"]
+            rest = key[len(SUGGESTIONS_PREFIX):]
+            if key.endswith(".json") and "/" not in rest:
+                legacy.append((key, obj["LastModified"].isoformat()))
 
-
-async def _read_all_suggestions() -> list[dict]:
-    keys = await asyncio.to_thread(_list_suggestion_keys_sync)
-    suggestions: list[dict] = []
-    for k in keys:
+    migrated = 0
+    for key, last_modified in legacy:
         try:
-            resp = await asyncio.to_thread(s3.get_object, Bucket=R2_BUCKET_NAME, Key=k)
-            suggestions.append(json.loads(resp["Body"].read()))
+            resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+            s = json.loads(resp["Body"].read())
+            s.setdefault("status", "pending")
+            if not s.get("submitted_at"):
+                s["submitted_at"] = last_modified.replace("+00:00", "Z")
+            new_key = _suggestion_object_key(s)
+            if new_key == key:
+                continue
+            s3.put_object(
+                Bucket=R2_BUCKET_NAME,
+                Key=new_key,
+                Body=json.dumps(s).encode("utf-8"),
+                ContentType="application/json",
+            )
+            s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+            migrated += 1
         except Exception:
-            logger.exception("Failed to read suggestion %s", k)
-    suggestions.sort(key=lambda s: s.get("submitted_at", ""), reverse=True)
-    return suggestions
+            logger.exception("Failed to migrate legacy suggestion %s", key)
+    return migrated
 
 
 def _find_pending_image_ext_sync(image_id: str) -> str | None:
@@ -374,6 +492,9 @@ async def verify_turnstile(
 _upload_counter: dict[str, int] = {}
 _upload_counter_lock = asyncio.Lock()
 _ip_hash_salt = secrets.token_bytes(16)
+
+# Hold references to fire-and-forget tasks so the event loop can't GC them mid-flight.
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _hash_ip(ip: str) -> str:
@@ -483,7 +604,16 @@ class PublicSuggestionRequest(BaseModel):
     site: str
     kind: Literal["new", "edit", "delete"]
     payload: dict = Field(default_factory=dict)
-    image_ids: list[str] = Field(default_factory=list)
+    image_ids: list[str] = Field(default_factory=list, max_length=MAX_SUGGESTION_IMAGE_IDS)
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_within_limit(cls, v: dict) -> dict:
+        if len(json.dumps(v).encode("utf-8")) > MAX_PUBLIC_PAYLOAD_BYTES:
+            raise ValueError(
+                f"payload too large (max {MAX_PUBLIC_PAYLOAD_BYTES // (1024 * 1024)} MB)"
+            )
+        return v
 
 
 class SuggestionEditRequest(BaseModel):
@@ -505,7 +635,7 @@ async def auth_check():
 
 @app.get("/api/content", dependencies=[Depends(require_api_key)])
 async def get_content(prefix: str):
-    if not s3:
+    if not S3_CONFIGURED:
         raise HTTPException(status_code=500, detail="S3 client not configured")
     try:
         contents = await asyncio.to_thread(_list_all_objects, prefix)
@@ -562,7 +692,7 @@ async def get_content(prefix: str):
 @app.post("/api/upload", dependencies=[Depends(require_api_key)])
 async def upload_content(prefix: str = Form(...), override_filename: str = Form(None), file: UploadFile = File(...)):
     try:
-        if not s3:
+        if not S3_CONFIGURED:
             raise HTTPException(status_code=500, detail="S3 client not configured")
 
         content = await file.read()
@@ -600,7 +730,7 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
 
 @app.delete("/api/content", dependencies=[Depends(require_api_key)])
 async def delete_content(key: str):
-    if not s3:
+    if not S3_CONFIGURED:
         raise HTTPException(status_code=500, detail="S3 client not configured")
     try:
         await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=key)
@@ -611,7 +741,7 @@ async def delete_content(key: str):
 
 @app.post("/api/content/bulk-delete", dependencies=[Depends(require_api_key)])
 async def bulk_delete_content(req: BulkDeleteRequest):
-    if not s3:
+    if not S3_CONFIGURED:
         raise HTTPException(status_code=500, detail="S3 client not configured")
     if not req.keys:
         return {"deleted": [], "errors": []}
@@ -660,6 +790,12 @@ async def public_upload_image(
         use_test_keys=_use_test_turnstile(request),
     )
 
+    # Reject oversized uploads before reading the spooled file into memory.
+    if file.size is not None and file.size > MAX_PUBLIC_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_PUBLIC_UPLOAD_BYTES // (1024 * 1024)} MB)",
+        )
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -732,7 +868,9 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
     sample_url = None
     if images and PUBLIC_URL_PREFIX:
         sample_url = f"{PUBLIC_URL_PREFIX.rstrip('/')}/{PENDING_PREFIX}{images[0]['id']}_p.webp"
-    asyncio.create_task(_notify_discord(suggestion, sample_url))
+    task = asyncio.create_task(_notify_discord(suggestion, sample_url))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {"id": sid}
 
@@ -740,48 +878,41 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
 # ---------------- Admin suggestion endpoints ----------------
 
 @app.get("/api/suggestions", dependencies=[Depends(require_api_key)])
-async def list_suggestions(site: str | None = None, status: str | None = None):
-    suggestions = await _read_all_suggestions()
-    if site:
-        suggestions = [s for s in suggestions if s.get("site") == site]
-    if status:
-        suggestions = [s for s in suggestions if s.get("status") == status]
-    return {"suggestions": suggestions}
+async def list_suggestions(
+    site: str | None = None,
+    status: str | None = None,
+    limit: int = SUGGESTIONS_PAGE_LIMIT,
+):
+    limit = max(1, min(limit, 1000))
+    suggestions, total = await asyncio.to_thread(_list_suggestions_sync, site, status, limit)
+    return {"suggestions": suggestions, "total": total, "truncated": total > len(suggestions)}
 
 
 @app.get("/api/suggestions/counts", dependencies=[Depends(require_api_key)])
 async def suggestion_counts():
-    suggestions = await _read_all_suggestions()
-    counts: dict[str, dict[str, int]] = {
-        site: {"pending": 0, "approved": 0, "rejected": 0} for site in ALLOWED_SITES
-    }
-    for s in suggestions:
-        site = s.get("site")
-        if not isinstance(site, str):
-            continue
-        status = s.get("status", "pending")
-        if site not in counts:
-            counts[site] = {"pending": 0, "approved": 0, "rejected": 0}
-        if status in counts[site]:
-            counts[site][status] += 1
+    counts = await asyncio.to_thread(_count_suggestions_sync)
+    for site in ALLOWED_SITES:
+        counts.setdefault(site, {st: 0 for st in _SUGGESTION_STATUSES})
     return counts
 
 
 @app.get("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
 async def get_suggestion(suggestion_id: str):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
+    result = await _read_suggestion(suggestion_id)
+    if not result:
         raise HTTPException(status_code=404, detail="Suggestion not found")
+    s, _ = result
     return s
 
 
 @app.patch("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
 async def edit_suggestion(suggestion_id: str, req: SuggestionEditRequest):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
+    result = await _read_suggestion(suggestion_id)
+    if not result:
         raise HTTPException(status_code=404, detail="Suggestion not found")
+    s, old_key = result
     if s.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Only pending suggestions can be edited")
 
@@ -794,7 +925,7 @@ async def edit_suggestion(suggestion_id: str, req: SuggestionEditRequest):
             raise HTTPException(status_code=400, detail=f"Unknown site: {req.site}")
         s["site"] = req.site
 
-    await _write_suggestion(s)
+    await _write_suggestion(s, old_key=old_key)
     return s
 
 
@@ -846,9 +977,10 @@ async def _approve_suggestion(s: dict) -> dict:
 @app.patch("/api/suggestions/{suggestion_id}/status", dependencies=[Depends(require_api_key)])
 async def update_suggestion_status(suggestion_id: str, req: SuggestionStatusRequest):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
+    result = await _read_suggestion(suggestion_id)
+    if not result:
         raise HTTPException(status_code=404, detail="Suggestion not found")
+    s, old_key = result
     if s.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Suggestion already finalized")
 
@@ -857,7 +989,7 @@ async def update_suggestion_status(suggestion_id: str, req: SuggestionStatusRequ
     else:
         s["status"] = "rejected"
 
-    await _write_suggestion(s)
+    await _write_suggestion(s, old_key=old_key)
     return s
 
 
@@ -868,9 +1000,10 @@ async def update_suggestion_status(suggestion_id: str, req: SuggestionStatusRequ
 async def reject_image(suggestion_id: str, image_id: str):
     _validate_id(suggestion_id, "suggestion")
     _validate_id(image_id, "image")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
+    result = await _read_suggestion(suggestion_id)
+    if not result:
         raise HTTPException(status_code=404, detail="Suggestion not found")
+    s, old_key = result
     if s.get("status") != "pending":
         raise HTTPException(status_code=400, detail="Cannot modify images on finalized suggestion")
 
@@ -896,16 +1029,17 @@ async def reject_image(suggestion_id: str, image_id: str):
         logger.exception("Failed to delete removed image files (non-fatal)")
 
     s["images"] = [i for i in s.get("images", []) if i.get("id") != image_id]
-    await _write_suggestion(s)
+    await _write_suggestion(s, old_key=old_key)
     return s
 
 
 @app.delete("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
 async def delete_suggestion(suggestion_id: str):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
+    result = await _read_suggestion(suggestion_id)
+    if not result:
         raise HTTPException(status_code=404, detail="Suggestion not found")
+    s, suggestion_key = result
 
     keys_to_delete: list[str] = []
     for img in s.get("images", []):
@@ -927,7 +1061,7 @@ async def delete_suggestion(suggestion_id: str):
         except Exception:
             logger.exception("Failed to delete pending images during suggestion deletion (non-fatal)")
 
-    await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=_suggestion_key(suggestion_id))
+    await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=suggestion_key)
     return {"deleted": True, "id": suggestion_id}
 
 

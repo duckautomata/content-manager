@@ -146,7 +146,9 @@ All public endpoints require a Cloudflare Turnstile token. CORS is restricted to
 
 ```
 _suggestions/
-  {sug_id}.json                        # one file per suggestion
+  {site}/
+    {status}/                          # pending | approved | rejected
+      {submitted_at}__{sug_id}.json    # one suggestion per file; site+status live in the key
   _pending/
     {img_id}.{ext}                     # original (TTL'd 30d)
     {img_id}_p.webp                    # preview
@@ -158,9 +160,15 @@ _suggestions/
   {img_id}_t.webp
 ```
 
+Encoding `site`/`status`/`submitted_at` in the key lets `/counts` and the list
+endpoint work from key listings alone (no per-object reads), so they scale to tens
+of thousands of suggestions. Approving, rejecting, or editing a suggestion moves
+the object to its new key. Legacy flat-layout files (`_suggestions/{id}.json`) are
+migrated into this layout automatically on startup.
+
 ### R2 lifecycle rule
 
-Set a 30-day delete rule on the prefix `_suggestions/_pending/`. The suggestion JSON files (at `_suggestions/{id}.json`) will not match and stay forever as an audit trail. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days.
+Set a 30-day delete rule on the prefix `_suggestions/_pending/`. The suggestion JSON files (under `_suggestions/{site}/{status}/`) will not match and stay forever as an audit trail. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days.
 
 ### Cloudflare Turnstile setup
 
@@ -186,7 +194,7 @@ Cloudflare dashboard → **Security → WAF → Rate limiting rules** → Create
 
 | Method | Path                                                       | Purpose                                                  |
 |--------|------------------------------------------------------------|----------------------------------------------------------|
-| GET    | `/api/suggestions?site=&status=`                           | List suggestions (filter optional)                       |
+| GET    | `/api/suggestions?site=&status=&limit=`                    | List newest-first (filters optional; `limit` default 200, max 1000). Returns `{suggestions, total, truncated}` |
 | GET    | `/api/suggestions/counts`                                  | `{site: {pending, approved, rejected}}` for tabs         |
 | GET    | `/api/suggestions/{id}`                                    | Get single suggestion                                    |
 | PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending)    |
