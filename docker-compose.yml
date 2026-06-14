@@ -15,9 +15,21 @@ services:
       - "8090:8090"
     environment:
       - PORT=8090
+      # Optional tuning — values below are the defaults; edit to override.
+      - MAX_UPLOAD_MB=25       # max size of a single upload (matches the app's public cap)
+      - WEBP_QUALITY=75        # output quality, 1-100
+      - WEBP_EFFORT=4          # compression effort, 0-6 (higher = smaller + slower)
+      # - MAX_CONCURRENCY=4    # max simultaneous conversions (default: CPU core count)
+      # - VIPS_CONCURRENCY=0   # libvips threads per operation (0 = libvips default)
     networks:
       - content-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/root/server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 networks:
   content-network:

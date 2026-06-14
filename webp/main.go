@@ -3,19 +3,26 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/davidbyttow/govips/v2/vips"
 	"github.com/gosimple/slug"
@@ -30,33 +37,162 @@ var supportedInputFormats = map[string]bool{
 	"mp4": true, "mov": true, "webm": true, "mkv": true, "avi": true,
 }
 
+// ---------------- Configuration ----------------
+
+const (
+	maxZipEntries = 5000
+	ffmpegTimeout = 30 * time.Second
+)
+
+var (
+	maxUploadBytes int64         = 25 * 1024 * 1024 // override via MAX_UPLOAD_MB
+	webpQuality                  = 75               // override via WEBP_QUALITY (1-100)
+	webpEffort                   = 4                // override via WEBP_EFFORT (0-6)
+	convertSem     chan struct{}                    // caps concurrent heavy conversions
+)
+
+func loadConfig() {
+	if v := os.Getenv("MAX_UPLOAD_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxUploadBytes = int64(n) * 1024 * 1024
+		}
+	}
+	if v := os.Getenv("WEBP_QUALITY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 100 {
+			webpQuality = n
+		}
+	}
+	if v := os.Getenv("WEBP_EFFORT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 6 {
+			webpEffort = n
+		}
+	}
+	concurrency := runtime.NumCPU()
+	if v := os.Getenv("MAX_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			concurrency = n
+		}
+	}
+	convertSem = make(chan struct{}, concurrency)
+	log.Printf("config: maxUpload=%dMB webpQuality=%d webpEffort=%d maxConcurrency=%d",
+		maxUploadBytes/(1024*1024), webpQuality, webpEffort, concurrency)
+}
+
 func main() {
-	// Initialize libvips
-	vips.Startup(&vips.Config{
-		ConcurrencyLevel: 0,
-		CacheTrace:       false,
-		CollectStats:     false,
-	})
-	defer vips.Shutdown()
-
-	// Routes
-	http.HandleFunc("/", handleIndex)              // UI
-	http.HandleFunc("/info", handleInfo)           // Basic info of the image
-	http.HandleFunc("/convert", handleConvert)     // Always WebP
-	http.HandleFunc("/thumbnail", handleThumbnail) // Scale + WebP
-	http.HandleFunc("/bulk", handleBulk)           // Zip -> WebP Zip
-	http.HandleFunc("/slug", handleSlug)           // Generate slugs
-	http.HandleFunc("/formats", handleFormats)     // List supported input formats
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	fmt.Printf("WebP Server running on port %s...\n", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		fmt.Printf("Server failed: %v\n", err)
+	// Health-check mode (used by the container HEALTHCHECK); runs before vips init.
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(runHealthCheck(port))
 	}
+
+	loadConfig()
+
+	vipsConcurrency := 0 // 0 => libvips default (threads per operation)
+	if v := os.Getenv("VIPS_CONCURRENCY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			vipsConcurrency = n
+		}
+	}
+	vips.Startup(&vips.Config{
+		ConcurrencyLevel: vipsConcurrency,
+		CacheTrace:       false,
+		CollectStats:     false,
+	})
+	defer vips.Shutdown()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleIndex)        // UI
+	mux.HandleFunc("/health", handleHealth) // Liveness probe
+	mux.HandleFunc("/info", limit(handleInfo))
+	mux.HandleFunc("/convert", limit(handleConvert))
+	mux.HandleFunc("/thumbnail", limit(handleThumbnail))
+	mux.HandleFunc("/bulk", limit(handleBulk))
+	mux.HandleFunc("/slug", handleSlug)
+	mux.HandleFunc("/formats", handleFormats)
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           logRequests(mux),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Graceful shutdown so in-flight conversions drain and vips.Shutdown runs.
+	done := make(chan struct{})
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Println("shutdown signal received; draining connections...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown error: %v", err)
+		}
+		close(done)
+	}()
+
+	log.Printf("WebP server running on port %s", port)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("server failed: %v", err)
+	}
+	<-done
+	log.Println("server stopped")
+}
+
+// limit caps concurrent CPU/memory-heavy conversions to protect the host.
+func limit(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		convertSem <- struct{}{}
+		defer func() { <-convertSem }()
+		h(w, r)
+	}
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func logRequests(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(rec, r)
+		log.Printf("%s %s %d %s", r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+	})
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+// runHealthCheck performs a one-shot GET /health for the container HEALTHCHECK.
+func runHealthCheck(port string) int {
+	client := http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + "/health")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+		return 1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck got status %d\n", resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 // ---------------- Handlers ----------------
@@ -77,10 +213,8 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read bytes explicitly to compute hash
-	buf, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
+	buf, ok := readLimitedBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -147,8 +281,11 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := r.Header.Get("Content-Type")
-	img, err := loadImage(r.Body, contentType)
+	buf, ok := readLimitedBody(w, r)
+	if !ok {
+		return
+	}
+	img, err := loadImage(buf, r.Header.Get("Content-Type"))
 	if err != nil {
 		http.Error(w, "Failed to load image", http.StatusBadRequest)
 		return
@@ -172,8 +309,11 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := r.Header.Get("Content-Type")
-	img, err := loadImage(r.Body, contentType)
+	buf, ok := readLimitedBody(w, r)
+	if !ok {
+		return
+	}
+	img, err := loadImage(buf, r.Header.Get("Content-Type"))
 	if err != nil {
 		http.Error(w, "Failed to load image", http.StatusBadRequest)
 		return
@@ -208,13 +348,13 @@ func handleBulk(w http.ResponseWriter, r *http.Request) {
 
 	targetHeight := 0
 	if hStr := r.URL.Query().Get("height"); hStr != "" {
-		h, err := strconv.Atoi(hStr)
-		if err == nil {
+		if h, err := strconv.Atoi(hStr); err == nil {
 			targetHeight = h
 		}
 	}
 
-	// Stream upload to temp file
+	// Stream the (size-capped) upload to a temp file.
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
 	tmpFile, err := os.CreateTemp("", "bulk-upload-*.zip")
 	if err != nil {
 		http.Error(w, "Server error", http.StatusInternalServerError)
@@ -224,12 +364,20 @@ func handleBulk(w http.ResponseWriter, r *http.Request) {
 	defer tmpFile.Close()
 
 	if _, err := io.Copy(tmpFile, r.Body); err != nil {
-		http.Error(w, "Upload failed", http.StatusInternalServerError)
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, fmt.Sprintf("Payload too large (max %d MB)", maxUploadBytes/(1024*1024)), http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Upload failed", http.StatusInternalServerError)
+		}
 		return
 	}
 
-	// Open Zip
-	fi, _ := tmpFile.Stat()
+	fi, err := tmpFile.Stat()
+	if err != nil {
+		http.Error(w, "Server error", http.StatusInternalServerError)
+		return
+	}
 	zipReader, err := zip.NewReader(tmpFile, fi.Size())
 	if err != nil {
 		http.Error(w, "Invalid zip file", http.StatusBadRequest)
@@ -243,7 +391,20 @@ func handleBulk(w http.ResponseWriter, r *http.Request) {
 	zipWriter := zip.NewWriter(w)
 	defer zipWriter.Close()
 
+	processed := 0
 	for _, file := range zipReader.File {
+		if processed >= maxZipEntries {
+			log.Printf("bulk: entry limit (%d) reached; skipping remaining entries", maxZipEntries)
+			break
+		}
+		processed++
+
+		// Guard against decompression bombs using the declared uncompressed size.
+		if file.UncompressedSize64 > uint64(maxUploadBytes) {
+			log.Printf("bulk: skipping oversized entry %s (%d bytes uncompressed)", file.Name, file.UncompressedSize64)
+			continue
+		}
+
 		ext := strings.ToLower(filepath.Ext(file.Name))
 		if len(ext) > 1 {
 			ext = ext[1:] // remove dot
@@ -256,16 +417,13 @@ func handleBulk(w http.ResponseWriter, r *http.Request) {
 
 		processedBytes, err := processImageToWebP(file, targetHeight)
 		if err != nil {
-			fmt.Printf("Failed to process %s: %v. Copying original.\n", file.Name, err)
+			log.Printf("bulk: failed to process %s: %v; copying original", file.Name, err)
 			copyZipEntry(zipWriter, file, file.Name)
 			continue
 		}
 
-		nameWithoutExt := strings.TrimSuffix(file.Name, filepath.Ext(file.Name))
-		newName := nameWithoutExt + ".webp"
-
-		writer, err := zipWriter.Create(newName)
-		if err == nil {
+		newName := strings.TrimSuffix(file.Name, filepath.Ext(file.Name)) + ".webp"
+		if writer, err := zipWriter.Create(newName); err == nil {
 			writer.Write(processedBytes)
 		}
 	}
@@ -286,7 +444,10 @@ func handleSlug(w http.ResponseWriter, r *http.Request) {
 	slugName := slug.Make(name)
 
 	b := make([]byte, 2)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		http.Error(w, "Failed to generate slug", http.StatusInternalServerError)
+		return
+	}
 	hexStr := hex.EncodeToString(b)
 	slugWithHex := fmt.Sprintf("%s-%s", slugName, strings.ToUpper(hexStr))
 
@@ -319,32 +480,69 @@ func handleFormats(w http.ResponseWriter, r *http.Request) {
 
 // ---------------- Helpers ----------------
 
+// readLimitedBody reads the request body up to maxUploadBytes, writing the
+// appropriate error response (413/400) and returning ok=false on failure.
+func readLimitedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	buf, err := io.ReadAll(r.Body)
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			http.Error(w, fmt.Sprintf("Payload too large (max %d MB)", maxUploadBytes/(1024*1024)), http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+		}
+		return nil, false
+	}
+	return buf, true
+}
+
+// looksLikeVideo decides whether to run an ffmpeg frame-extraction pass before
+// handing bytes to libvips, using the Content-Type plus common container magic.
+func looksLikeVideo(buf []byte, contentType string) bool {
+	if strings.HasPrefix(contentType, "video/") {
+		return true
+	}
+	if len(buf) >= 12 {
+		if string(buf[4:8]) == "ftyp" { // MP4 / MOV / ISO-BMFF
+			return true
+		}
+		if buf[0] == 0x1A && buf[1] == 0x45 && buf[2] == 0xDF && buf[3] == 0xA3 { // Matroska / WebM
+			return true
+		}
+		if string(buf[0:4]) == "RIFF" && string(buf[8:12]) == "AVI " { // AVI
+			return true
+		}
+	}
+	return false
+}
+
 func extractVideoFrame(vidBuf []byte) ([]byte, error) {
-	cmd := exec.Command("ffmpeg", "-y", "-i", "pipe:0", "-frames:v", "1", "-c:v", "png", "-f", "image2", "-")
+	ctx, cancel := context.WithTimeout(context.Background(), ffmpegTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y", "-i", "pipe:0", "-frames:v", "1", "-c:v", "png", "-f", "image2", "-")
 	cmd.Stdin = bytes.NewReader(vidBuf)
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
 
-	err := cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("ffmpeg timed out after %s", ffmpegTimeout)
+		}
 		return nil, err
 	}
 	return out.Bytes(), nil
 }
 
-func loadImage(r io.Reader, contentType string) (*vips.ImageRef, error) {
-	buf, err := io.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
-
-	if strings.HasPrefix(contentType, "video/") || (len(buf) > 8 && string(buf[4:8]) == "ftyp") {
+func loadImage(buf []byte, contentType string) (*vips.ImageRef, error) {
+	if looksLikeVideo(buf, contentType) {
 		frameBuf, err := extractVideoFrame(buf)
 		if err == nil && len(frameBuf) > 0 {
 			buf = frameBuf
 		} else {
-			fmt.Printf("Warning: Failed to extract frame with ffmpeg: %v\n", err)
+			log.Printf("warning: failed to extract video frame: %v", err)
 		}
 	}
 
@@ -354,24 +552,24 @@ func loadImage(r io.Reader, contentType string) (*vips.ImageRef, error) {
 }
 
 func sendWebP(w http.ResponseWriter, img *vips.ImageRef) {
-	bytes, err := exportToWebP(img)
+	data, err := exportToWebP(img)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Export error: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "image/webp")
-	w.Header().Set("Content-Length", strconv.Itoa(len(bytes)))
-	w.Write(bytes)
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
 }
 
 func exportToWebP(img *vips.ImageRef) ([]byte, error) {
 	p := vips.NewWebpExportParams()
-	p.Quality = 75
-	p.ReductionEffort = 4
+	p.Quality = webpQuality
+	p.ReductionEffort = webpEffort
 
-	bytes, _, err := img.ExportWebp(p)
-	return bytes, err
+	data, _, err := img.ExportWebp(p)
+	return data, err
 }
 
 func processImageToWebP(file *zip.File, targetHeight int) ([]byte, error) {
@@ -408,10 +606,18 @@ func processImageToWebP(file *zip.File, targetHeight int) ([]byte, error) {
 }
 
 func copyZipEntry(zw *zip.Writer, file *zip.File, name string) {
-	rc, _ := file.Open()
+	rc, err := file.Open()
+	if err != nil {
+		log.Printf("bulk: failed to open entry %s: %v", name, err)
+		return
+	}
 	defer rc.Close()
-	w, _ := zw.Create(name)
-	io.Copy(w, rc)
+	out, err := zw.Create(name)
+	if err != nil {
+		log.Printf("bulk: failed to create zip entry %s: %v", name, err)
+		return
+	}
+	io.Copy(out, rc)
 }
 
 // ---------------- HTML Content ----------------

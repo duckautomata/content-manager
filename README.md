@@ -117,6 +117,21 @@ To update the image, run:
 docker compose pull && docker compose up -d
 ```
 
+### Image converter configuration
+
+The `webp-converter` reads its settings from environment variables (set them in the
+`environment:` block of `docker-compose.yml` — it does **not** read `.env`). All are
+optional:
+
+| Variable           | Default        | Purpose                                                      |
+|--------------------|----------------|--------------------------------------------------------------|
+| `PORT`             | `8080`         | Port the server listens on (compose sets `8090`).            |
+| `MAX_UPLOAD_MB`    | `25`           | Max size of a single upload; larger requests get `413`.      |
+| `WEBP_QUALITY`     | `75`           | WebP output quality (1–100).                                 |
+| `WEBP_EFFORT`      | `4`            | WebP compression effort (0–6; higher = smaller but slower).  |
+| `MAX_CONCURRENCY`  | CPU core count | Max simultaneous conversions (protects small hosts).         |
+| `VIPS_CONCURRENCY` | `0`            | libvips threads per operation (`0` = libvips default).       |
+
 ### Building new image
 To build a new image with the latest tag, run
 ```bash
