@@ -12,11 +12,14 @@ const state = {
     videos: [],
     others: [],
     publicUrlPrefix: '',
-    filter: ''
+    filter: '',
+    scheduledByKey: new Map()
 };
 
 // DOM Elements
 const prefixInput = document.getElementById('prefix-input');
+const prefixPresets = document.getElementById('prefix-presets');
+const syncSheetBtn = document.getElementById('sync-sheet-btn');
 const refreshBtn = document.getElementById('refresh-btn');
 const dropzone = document.getElementById('dropzone');
 const fileInput = document.getElementById('file-input');
@@ -30,6 +33,9 @@ const videosGrid = document.getElementById('videos-grid');
 const videosCount = document.getElementById('videos-count');
 const othersList = document.getElementById('others-list');
 const othersCount = document.getElementById('others-count');
+const dataFilesSection = document.getElementById('data-files-section');
+const dataFilesList = document.getElementById('data-files-list');
+const dataFilesCount = document.getElementById('data-files-count');
 
 const filterInput = document.getElementById('filter-input');
 const replaceFileInput = document.getElementById('replace-file-input');
@@ -46,12 +52,28 @@ const confirmMessage = document.getElementById('confirm-message');
 const confirmOkBtn = document.getElementById('confirm-ok-btn');
 const confirmCancelBtn = document.getElementById('confirm-cancel-btn');
 const confirmBackdrop = confirmModal.querySelector('.modal-backdrop');
+const confirmDelayRow = document.getElementById('confirm-delay-row');
+const confirmDelay = document.getElementById('confirm-delay');
+
+// Delayed-delete presets offered in the delete dialog (seconds; 0 = delete now).
+const DELETE_DELAYS = [
+    { label: 'Delete now', seconds: 0 },
+    { label: 'In 1 hour', seconds: 3600 },
+    { label: 'In 10 hours', seconds: 36000 },
+    { label: 'In 1 day', seconds: 86400 },
+    { label: 'In 1 week', seconds: 604800 },
+    { label: 'In 1 month', seconds: 2592000 },
+];
+confirmDelay.innerHTML = DELETE_DELAYS
+    .map(d => `<option value="${d.seconds}">${d.label}</option>`)
+    .join('');
 
 const toastContainer = document.getElementById('toast-container');
 const modalOrigLink = document.getElementById('modal-original-link');
 const modalPrevLink = document.getElementById('modal-preview-link');
 const modalDelBtn = document.getElementById('modal-delete-btn');
 const modalCopyIdBtn = document.getElementById('modal-copy-id-btn');
+const modalCancelScheduleBtn = document.getElementById('modal-cancel-schedule-btn');
 const closeBtn = document.querySelector('.close-modal-btn');
 const backdrop = document.querySelector('.modal-backdrop');
 
@@ -153,12 +175,14 @@ function toast(message, type = 'info') {
 }
 
 // Custom confirm dialog. Returns Promise<boolean>.
-function confirmAction({ title = 'Confirm', message = '', confirmText = 'Confirm', danger = true } = {}) {
+function confirmAction({ title = 'Confirm', message = '', confirmText = 'Confirm', danger = true, withDelay = false } = {}) {
     return new Promise(resolve => {
         confirmTitle.textContent = title;
         confirmMessage.textContent = message;
         confirmOkBtn.textContent = confirmText;
         confirmOkBtn.className = `btn ${danger ? 'danger-btn' : 'primary-btn'}`;
+        confirmDelayRow.classList.toggle('hidden', !withDelay);
+        if (withDelay) confirmDelay.value = '0';
 
         const cleanup = (result) => {
             confirmModal.classList.add('hidden');
@@ -168,8 +192,11 @@ function confirmAction({ title = 'Confirm', message = '', confirmText = 'Confirm
             document.removeEventListener('keydown', onKey);
             resolve(result);
         };
-        const onOk = () => cleanup(true);
-        const onCancel = () => cleanup(false);
+        // When withDelay, resolve an object; otherwise keep the boolean contract.
+        const ok = () => withDelay ? { confirmed: true, delaySeconds: Number(confirmDelay.value) } : true;
+        const no = () => withDelay ? { confirmed: false, delaySeconds: 0 } : false;
+        const onOk = () => cleanup(ok());
+        const onCancel = () => cleanup(no());
         const onKey = (e) => {
             if (e.key === 'Escape') onCancel();
             else if (e.key === 'Enter') onOk();
@@ -229,6 +256,93 @@ function formatDate(iso) {
     const d = new Date(iso);
     if (isNaN(d)) return '';
     return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// Navigate to a prefix: update state, input, URL, and reload content.
+function goToPrefix(newPrefix) {
+    if (!newPrefix) return;
+    if (!newPrefix.endsWith('/')) newPrefix += '/';
+    state.prefix = newPrefix;
+    prefixInput.value = newPrefix;
+    updateUrlPrefix(newPrefix);
+    fetchContent();
+}
+
+// Populate the "Go to" dropdown with the configured common prefixes. Keeps the
+// leading placeholder and marks the current prefix as selected when it matches.
+let _renderedPresets = '';
+function renderPrefixPresets(prefixes) {
+    if (!prefixPresets) return;
+    const signature = prefixes.join('|');
+    if (signature !== _renderedPresets) {
+        _renderedPresets = signature;
+        prefixPresets.innerHTML = '<option value="" disabled>Go to…</option>';
+        for (const p of prefixes) {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.textContent = p.replace(/\/$/, '');
+            prefixPresets.appendChild(opt);
+        }
+    }
+    // Reflect the current prefix if it's one of the presets, else show placeholder.
+    prefixPresets.value = prefixes.includes(state.prefix) ? state.prefix : '';
+}
+
+if (prefixPresets) {
+    prefixPresets.addEventListener('change', () => {
+        const p = prefixPresets.value;
+        if (p) goToPrefix(p);
+    });
+}
+
+// Show the "Data Files" section (and its "Update from spreadsheet" button) only
+// for prefixes that have Google Sheet CSV sources configured on the backend.
+let _csvSources = [];
+function renderSyncButton(files) {
+    _csvSources = files;
+    if (dataFilesSection) dataFilesSection.classList.toggle('hidden', files.length === 0);
+    if (syncSheetBtn && files.length) {
+        syncSheetBtn.title = `Re-download from Google Sheets: ${files.join(', ')}`;
+    }
+}
+
+if (syncSheetBtn) {
+    const syncLabel = syncSheetBtn.querySelector('.sync-label');
+    const syncIcon = syncSheetBtn.querySelector('svg');
+    syncSheetBtn.addEventListener('click', async () => {
+        if (!_csvSources.length) return;
+        const ok = await confirmAction({
+            title: 'Update from spreadsheet',
+            message: `Re-download ${_csvSources.join(', ')} from Google Sheets and overwrite the copies in ${state.prefix}?`,
+            confirmText: 'Update',
+        });
+        if (!ok) return;
+
+        syncSheetBtn.disabled = true;
+        syncIcon.classList.add('spinner');
+        if (syncLabel) syncLabel.textContent = 'Updating…';
+        try {
+            const res = await apiFetch(`${BASE_PATH}api/content/sync-csv?prefix=${encodeURIComponent(state.prefix)}`, {
+                method: 'POST',
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+            const updated = data.updated || [];
+            const errs = data.errors || [];
+            if (errs.length) {
+                toast(`Updated ${updated.length}; failed: ${errs.map(e => `${e.file} (${e.error})`).join(', ')}`, 'error');
+            } else {
+                toast(`Updated ${updated.join(', ') || 'nothing'}`, 'success');
+            }
+            fetchContent();
+        } catch (e) {
+            if (e.message !== 'Unauthorized') toast(`Update failed: ${e.message}`, 'error');
+        } finally {
+            syncSheetBtn.disabled = false;
+            syncIcon.classList.remove('spinner');
+            if (syncLabel) syncLabel.textContent = 'Update from spreadsheet';
+        }
+    });
 }
 
 // Update URL without reloading
@@ -393,6 +507,9 @@ async function fetchContent() {
         state.others = data.others || [];
         state.publicUrlPrefix = data.public_url_prefix || '';
 
+        renderPrefixPresets(data.common_prefixes || []);
+        renderSyncButton(data.csv_sources || []);
+        await loadScheduledDeletes();
         renderContent();
     } catch (err) {
         console.error(err);
@@ -445,10 +562,12 @@ function createMediaCard(item, fallbackEmoji) {
     const thumbKey = item.files.thumbnail || item.files.original; // Fallback to original if no thumb somehow
     const url = getPublicUrl(state.prefix + thumbKey);
 
+    const sched = scheduledRecordFor(item);
     const card = document.createElement('div');
-    card.className = 'image-card glass-panel';
+    card.className = `image-card glass-panel${sched ? ' scheduled' : ''}`;
     card.innerHTML = `
         <img src="${escapeHtml(url)}" alt="${escapeHtml(item.slug)}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>${fallbackEmoji}</text></svg>'">
+        ${sched ? `<span class="sched-badge" title="Scheduled to delete ${escapeHtml(formatWhen(sched.due_at))}">⏳ ${escapeHtml(remainingShort(sched.due_at))}</span>` : ''}
         <div class="overlay">
             <span>${escapeHtml(item.slug)}</span>
         </div>
@@ -459,7 +578,8 @@ function createMediaCard(item, fallbackEmoji) {
 
 function createOtherItem(item) {
     const div = document.createElement('div');
-    div.className = 'list-item';
+    const sched = scheduledRecordFor(item);
+    div.className = `list-item${sched ? ' scheduled' : ''}`;
 
     const size = formatBytes(item.size);
     const date = formatDate(item.last_modified);
@@ -472,10 +592,12 @@ function createOtherItem(item) {
                 <div class="item-meta">
                     <span>${size}</span>
                     <span>${date}</span>
+                    ${sched ? `<span class="sched-badge" title="Scheduled to delete ${escapeHtml(formatWhen(sched.due_at))}">⏳ deletes in ${escapeHtml(remainingShort(sched.due_at))}</span>` : ''}
                 </div>
             </div>
         </div>
         <div class="item-actions">
+            ${sched ? `<button class="btn secondary-btn cancel-sched-btn" title="Cancel scheduled deletion">Cancel deletion</button>` : ''}
             <button class="btn secondary-btn replace-item-btn" title="Replace File">
                 <svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.3-11.23l4.63 4.66"/></svg>
             </button>
@@ -493,6 +615,9 @@ function createOtherItem(item) {
         replaceFileInput.click();
     });
     div.querySelector('.delete-item-btn').addEventListener('click', () => deleteItem(item));
+    if (sched) {
+        div.querySelector('.cancel-sched-btn').addEventListener('click', () => cancelScheduledDelete(sched.id, item.filename));
+    }
 
     return div;
 }
@@ -502,16 +627,26 @@ function renderContent() {
     imagesGrid.innerHTML = '';
     videosGrid.innerHTML = '';
     othersList.innerHTML = '';
+    dataFilesList.innerHTML = '';
 
     const f = state.filter;
     const imgs = f ? state.images.filter(i => i.slug.toLowerCase().includes(f)) : state.images;
     const vids = f ? state.videos.filter(v => v.slug.toLowerCase().includes(f)) : state.videos;
-    const others = f ? state.others.filter(o => o.filename.toLowerCase().includes(f)) : state.others;
+
+    // Split "others" into configured data files (from CSV_SOURCES) and the rest.
+    const csvSet = new Set(_csvSources);
+    const isDataFile = (o) => csvSet.has(o.filename);
+    const dataAll = state.others.filter(isDataFile);
+    const otherAll = state.others.filter(o => !isDataFile(o));
+    const dataFiles = f ? dataAll.filter(o => o.filename.toLowerCase().includes(f)) : dataAll;
+    const others = f ? otherAll.filter(o => o.filename.toLowerCase().includes(f)) : otherAll;
 
     imagesCount.textContent = imgs.length;
     videosCount.textContent = vids.length;
     othersCount.textContent = others.length;
+    dataFilesCount.textContent = dataFiles.length;
 
+    renderIncrementally(dataFilesList, dataFiles, createOtherItem);
     renderIncrementally(imagesGrid, imgs, (it) => createMediaCard(it, '🖼️'));
     renderIncrementally(videosGrid, vids, (it) => createMediaCard(it, '🎥'));
     renderIncrementally(othersList, others, createOtherItem);
@@ -523,16 +658,29 @@ function openModal(img) {
     const previewKey = img.files.preview || img.files.original || img.files.thumbnail;
     const origKey = img.files.original || img.files.preview || img.files.thumbnail;
 
+    const originalName = img.files.original || '';
+    const dotIdx = originalName.lastIndexOf('.');
+    const originalType = dotIdx > -1 ? originalName.slice(dotIdx + 1).toUpperCase() : '';
+
+    const sched = scheduledRecordFor(img);
     const metaParts = {
         dim: '',
+        type: originalType ? `Original: ${originalType}` : '',
         size: formatBytes(img.size),
         date: formatDate(img.last_modified),
+        sched: sched ? `⏳ Deletes ${formatWhen(sched.due_at)}` : '',
     };
     const renderMeta = () => {
-        modalMeta.textContent = [metaParts.dim, metaParts.size, metaParts.date]
+        modalMeta.textContent = [metaParts.dim, metaParts.type, metaParts.size, metaParts.date, metaParts.sched]
             .filter(Boolean)
             .join(' • ');
     };
+
+    // Show a "Cancel deletion" button only when this item has a pending schedule.
+    modalCancelScheduleBtn.classList.toggle('hidden', !sched);
+    modalCancelScheduleBtn.onclick = sched
+        ? async () => { closeModal(); await cancelScheduledDelete(sched.id, img.slug); }
+        : null;
 
     // Clear previous image
     modalImage.src = '';
@@ -560,18 +708,24 @@ function openModal(img) {
 
     // Delete action removes all associated files in one bulk request
     modalDelBtn.onclick = async () => {
-        const ok = await confirmAction({
+        const choice = await confirmAction({
             title: 'Delete file',
             message: `Delete ${img.slug} and all its variants?`,
             confirmText: 'Delete',
+            withDelay: true,
         });
-        if (!ok) return;
+        if (!choice.confirmed) return;
 
         const keys = [img.files.original, img.files.preview, img.files.thumbnail]
             .filter(Boolean)
             .map(k => state.prefix + k);
 
         closeModal();
+        if (choice.delaySeconds > 0) {
+            await scheduleDelete(keys, choice.delaySeconds, img.slug);
+            fetchContent();
+            return;
+        }
         try {
             const res = await apiFetch(`${BASE_PATH}api/content/bulk-delete`, {
                 method: 'POST',
@@ -602,12 +756,18 @@ function closeModal() {
 }
 
 async function deleteItem(item) {
-    const ok = await confirmAction({
+    const choice = await confirmAction({
         title: 'Delete file',
         message: `Delete ${item.filename}?`,
         confirmText: 'Delete',
+        withDelay: true,
     });
-    if (!ok) return;
+    if (!choice.confirmed) return;
+    if (choice.delaySeconds > 0) {
+        await scheduleDelete([item.key], choice.delaySeconds, item.filename);
+        fetchContent();
+        return;
+    }
     try {
         const res = await apiFetch(`${BASE_PATH}api/content?key=${encodeURIComponent(item.key)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Delete failed');
@@ -617,6 +777,85 @@ async function deleteItem(item) {
         console.error(err);
         toast('Delete failed', 'error');
     }
+}
+
+// ---------------- Scheduled (delayed) deletion ----------------
+
+async function scheduleDelete(keys, delaySeconds, label) {
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/content/schedule-delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keys, delay_seconds: delaySeconds, label, prefix: state.prefix }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+        toast(`${label} will be deleted ${formatWhen(data.due_at)}`, 'success');
+    } catch (e) {
+        if (e.message !== 'Unauthorized') toast(`Schedule failed: ${e.message}`, 'error');
+    }
+}
+
+async function cancelScheduledDelete(id, label) {
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/scheduled-deletes/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        toast(`Cancelled scheduled deletion${label ? ` of ${label}` : ''}`, 'success');
+        fetchContent();
+    } catch (e) {
+        if (e.message !== 'Unauthorized') toast(`Cancel failed: ${e.message}`, 'error');
+    }
+}
+
+// Load pending scheduled deletions for the current prefix into a key -> record map.
+async function loadScheduledDeletes() {
+    state.scheduledByKey = new Map();
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/scheduled-deletes?prefix=${encodeURIComponent(state.prefix)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        for (const rec of data.scheduled || []) {
+            for (const k of rec.keys || []) state.scheduledByKey.set(k, rec);
+        }
+    } catch (_) { /* non-fatal: badges just won't show */ }
+}
+
+// The R2 keys an item maps to (media items carry `files`, others carry `key`).
+function itemKeys(item) {
+    if (item.files) {
+        return [item.files.original, item.files.preview, item.files.thumbnail]
+            .filter(Boolean)
+            .map(k => state.prefix + k);
+    }
+    return item.key ? [item.key] : [];
+}
+
+function scheduledRecordFor(item) {
+    const map = state.scheduledByKey;
+    if (!map) return null;
+    for (const k of itemKeys(item)) {
+        const rec = map.get(k);
+        if (rec) return rec;
+    }
+    return null;
+}
+
+function formatWhen(iso) {
+    if (!iso) return 'later';
+    const d = new Date(iso);
+    if (isNaN(d)) return 'later';
+    return `on ${d.toLocaleString()}`;
+}
+
+// Compact remaining time, e.g. "3h", "2d", used for badges.
+function remainingShort(iso) {
+    const ms = new Date(iso) - new Date();
+    if (isNaN(ms) || ms <= 0) return 'soon';
+    const mins = Math.round(ms / 60000);
+    if (mins < 60) return `${mins}m`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 48) return `${hrs}h`;
+    return `${Math.round(hrs / 24)}d`;
 }
 
 // Upload Handling

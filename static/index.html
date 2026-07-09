@@ -27,6 +27,10 @@
                     <div class="prefix-selector">
                         <label for="prefix-input">Current Prefix:</label>
                         <input type="text" id="prefix-input" value="home/" placeholder="e.g. site1/">
+                        <label for="prefix-presets" class="visually-hidden">Common prefixes</label>
+                        <select id="prefix-presets" title="Go to a common prefix">
+                            <option value="" disabled selected>Go to…</option>
+                        </select>
                         <button id="refresh-btn" class="btn primary-btn">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                                 stroke-linecap="round" stroke-linejoin="round">
@@ -72,12 +76,23 @@
             </section>
 
             <section class="content-section">
-                <div class="section-header">
-                    <h2>Other Files</h2>
-                    <span id="others-count" class="badge">0</span>
-                </div>
-                <div id="others-list" class="list-container others-list">
-                    <!-- Other files will be injected here -->
+                <div id="data-files-section" class="hidden">
+                    <div class="section-header">
+                        <h2>Data Files</h2>
+                        <span id="data-files-count" class="badge">0</span>
+                        <button id="sync-sheet-btn" class="btn secondary-btn"
+                            title="Re-download these files from Google Sheets">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                                stroke-linecap="round" stroke-linejoin="round">
+                                <polyline points="23 4 23 10 17 10"></polyline>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                            </svg>
+                            <span class="sync-label">Update from spreadsheet</span>
+                        </button>
+                    </div>
+                    <div id="data-files-list" class="list-container others-list">
+                        <!-- CSV data files will be injected here -->
+                    </div>
                 </div>
 
                 <div class="section-header">
@@ -94,6 +109,14 @@
                 </div>
                 <div id="videos-grid" class="grid-container videos-grid">
                     <!-- Videos will be injected here -->
+                </div>
+
+                <div class="section-header">
+                    <h2>Other Files</h2>
+                    <span id="others-count" class="badge">0</span>
+                </div>
+                <div id="others-list" class="list-container others-list">
+                    <!-- Other files will be injected here -->
                 </div>
             </section>
         </main>
@@ -113,6 +136,7 @@
                         <a id="modal-original-link" href="#" target="_blank" class="btn secondary-btn">Original</a>
                         <a id="modal-preview-link" href="#" target="_blank" class="btn secondary-btn">WebP Prev</a>
                         <button id="modal-copy-id-btn" class="btn secondary-btn">Copy ID</button>
+                        <button id="modal-cancel-schedule-btn" class="btn secondary-btn hidden">Cancel deletion</button>
                         <button id="modal-delete-btn" class="btn danger-btn">Delete</button>
                     </div>
                 </div>
@@ -144,6 +168,10 @@
                 <div class="modal-details">
                     <h3 id="confirm-title">Confirm</h3>
                     <p id="confirm-message"></p>
+                    <div id="confirm-delay-row" class="confirm-delay-row hidden">
+                        <label for="confirm-delay">When:</label>
+                        <select id="confirm-delay"></select>
+                    </div>
                     <div class="modal-actions">
                         <button id="confirm-cancel-btn" class="btn secondary-btn">Cancel</button>
                         <button id="confirm-ok-btn" class="btn danger-btn">Confirm</button>

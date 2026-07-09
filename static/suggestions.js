@@ -33,6 +33,7 @@ const imageModalOriginal = document.getElementById('image-modal-original');
 const imageModalPreview = document.getElementById('image-modal-preview');
 const imageModalThumb = document.getElementById('image-modal-thumb');
 const imageModalRemove = document.getElementById('image-modal-remove');
+const imageModalCopyId = document.getElementById('image-modal-copy-id');
 const imageModalCloseBtn = document.getElementById('image-modal-close-btn');
 
 const editModal = document.getElementById('edit-modal');
@@ -432,6 +433,11 @@ function openImageModal(s, img) {
     imageModalPreview.href = previewUrl || '#';
     imageModalThumb.href = thumbUrl || '#';
 
+    imageModalCopyId.onclick = async () => {
+        const ok = await copyToClipboard(img.id);
+        toast(ok ? `Copied ${img.id}` : 'Copy failed', ok ? 'success' : 'error');
+    };
+
     const canReject = s.status === 'pending' && img.status === 'pending';
     imageModalRemove.style.display = canReject ? 'inline-flex' : 'none';
     imageModalRemove.onclick = canReject
@@ -458,7 +464,51 @@ function escapeHtml(str) {
     }[c]));
 }
 
+async function copyToClipboard(text) {
+    try {
+        if (navigator.clipboard) {
+            await navigator.clipboard.writeText(text);
+            return true;
+        }
+    } catch (_) { /* fall through to legacy path */ }
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.top = '0';
+        ta.style.left = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        return true;
+    } catch (e) {
+        console.error('Copy failed', e);
+        return false;
+    }
+}
+
 // ---------------- Actions ----------------
+
+// Disable a card's action buttons and show a spinner + label while an async
+// action is in flight. Returns a function that reverts the busy state (call it
+// on failure; on success the card is replaced by refresh()).
+function setCardBusy(s, label) {
+    const card = suggestionsList.querySelector(`[data-id="${CSS.escape(s.id)}"]`);
+    const actions = card && card.querySelector('.suggestion-actions');
+    if (!actions) return () => {};
+    const buttons = [...actions.querySelectorAll('button')];
+    buttons.forEach(b => b.disabled = true);
+    const status = document.createElement('span');
+    status.className = 'action-status';
+    status.innerHTML = `<span class="btn-spinner"></span><span>${escapeHtml(label)}</span>`;
+    actions.appendChild(status);
+    return () => {
+        status.remove();
+        buttons.forEach(b => b.disabled = false);
+    };
+}
 
 async function approveSuggestion(s) {
     const imgCount = (s.images || []).filter(i => i.status === 'pending').length;
@@ -471,6 +521,7 @@ async function approveSuggestion(s) {
         danger: false,
     });
     if (!ok) return;
+    const revert = setCardBusy(s, 'Approving…');
     try {
         const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(s.id)}/status`, {
             method: 'PATCH',
@@ -484,6 +535,7 @@ async function approveSuggestion(s) {
         toast(`Approved ${s.id}`, 'success');
         refresh();
     } catch (e) {
+        revert();
         if (e.message !== 'Unauthorized') toast(`Approve failed: ${e.message}`, 'error');
     }
 }
@@ -495,6 +547,7 @@ async function rejectSuggestion(s) {
         confirmText: 'Reject',
     });
     if (!ok) return;
+    const revert = setCardBusy(s, 'Rejecting…');
     try {
         const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(s.id)}/status`, {
             method: 'PATCH',
@@ -505,6 +558,7 @@ async function rejectSuggestion(s) {
         toast(`Rejected ${s.id}`, 'success');
         refresh();
     } catch (e) {
+        revert();
         if (e.message !== 'Unauthorized') toast(`Reject failed: ${e.message}`, 'error');
     }
 }
@@ -518,6 +572,7 @@ async function deleteSuggestion(s) {
         confirmText: 'Delete',
     });
     if (!ok) return;
+    const revert = setCardBusy(s, 'Deleting…');
     try {
         const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(s.id)}`, {
             method: 'DELETE',
@@ -526,6 +581,7 @@ async function deleteSuggestion(s) {
         toast(`Deleted ${s.id}`, 'success');
         refresh();
     } catch (e) {
+        revert();
         if (e.message !== 'Unauthorized') toast(`Delete failed: ${e.message}`, 'error');
     }
 }

@@ -7,7 +7,7 @@ import os
 import re
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import boto3
@@ -37,6 +37,47 @@ PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")
 API_KEY = os.environ.get("API_KEY")
 
 ALLOWED_SITES = [s.strip() for s in os.environ.get("ALLOWED_SITES", "").split(",") if s.strip()]
+# Frequently visited prefixes shown in the manager's "Go to" dropdown. Each is
+# normalized to end with a single "/".
+COMMON_PREFIXES = [
+    p.strip().rstrip("/") + "/"
+    for p in os.environ.get("COMMON_PREFIXES", "home,dokimotes,dokinomicon,dokimosaic").split(",")
+    if p.strip()
+]
+
+
+def _load_csv_sources() -> dict:
+    """Parse CSV_SOURCES (a JSON object) mapping a prefix to the Google Sheet
+    tabs whose CSV export should overwrite files under that prefix. Shape:
+
+        {"dokinomicon": [{"file": "data.csv", "id": "<sheet-id>", "gid": "0"}]}
+
+    Prefix keys are normalized to end with "/". Malformed config disables the
+    feature rather than crashing the app.
+    """
+    raw = os.environ.get("CSV_SOURCES", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("CSV_SOURCES is not valid JSON; spreadsheet sync disabled")
+        return {}
+    sources: dict = {}
+    for prefix, entries in (data or {}).items():
+        key = prefix.strip().rstrip("/") + "/"
+        cleaned = [
+            {"file": e["file"], "id": e["id"], "gid": str(e.get("gid", "0"))}
+            for e in entries
+            if e.get("file") and e.get("id")
+        ]
+        if cleaned:
+            sources[key] = cleaned
+    return sources
+
+
+# Prefix -> list of Google Sheet CSV sources for the "Update from spreadsheet" button.
+CSV_SOURCES = _load_csv_sources()
 TURNSTILE_ENABLED = os.environ.get("TURNSTILE_ENABLED", "true").strip().lower() in ("true", "1", "yes", "on")
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY")
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
@@ -50,6 +91,13 @@ MAX_SUGGESTION_IMAGE_IDS = 1000
 SUGGESTIONS_PAGE_LIMIT = 200
 SUGGESTIONS_PREFIX = "_suggestions/"
 PENDING_PREFIX = "_suggestions/_pending/"
+# Delayed-delete markers. Key encodes the due time so the sweep can filter by a
+# lexical compare without reading each object: {prefix}{YYYYMMDDTHHMMSSZ}__{id}.json
+SCHEDULED_DELETE_PREFIX = "_scheduled_deletes/"
+SCHEDULED_DELETE_POLL_SECONDS = int(os.environ.get("SCHEDULED_DELETE_POLL_SECONDS", "60"))
+_DUE_FMT = "%Y%m%dT%H%M%SZ"
+MAX_DELETE_DELAY_SECONDS = 366 * 24 * 3600  # ~1 year ceiling
+MIN_DELETE_DELAY_SECONDS = 60
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
 # Cloudflare's published always-pass test pair, used when a localhost origin is opted in via EXTRA_CORS_ORIGINS.
 TURNSTILE_TEST_SITE_KEY = "1x00000000000000000000AA"
@@ -102,9 +150,20 @@ async def lifespan(app: FastAPI):
             IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS,
         )
 
+    sweep_task: asyncio.Task | None = None
+    if S3_CONFIGURED and SCHEDULED_DELETE_POLL_SECONDS > 0:
+        sweep_task = asyncio.create_task(_scheduled_delete_loop())
+        logger.info("Scheduled-delete sweep enabled, poll=%ds", SCHEDULED_DELETE_POLL_SECONDS)
+
     try:
         yield
     finally:
+        if sweep_task is not None:
+            sweep_task.cancel()
+            try:
+                await sweep_task
+            except asyncio.CancelledError:
+                pass
         if rollup_task is not None:
             rollup_task.cancel()
             try:
@@ -599,6 +658,13 @@ class BulkDeleteRequest(BaseModel):
     keys: list[str]
 
 
+class ScheduleDeleteRequest(BaseModel):
+    keys: list[str]
+    delay_seconds: int
+    label: str | None = None
+    prefix: str | None = None
+
+
 class PublicSuggestionRequest(BaseModel):
     cf_turnstile_response: str = ""
     site: str
@@ -686,7 +752,8 @@ async def get_content(prefix: str):
     images_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     videos_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     final_others.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
-    return {"images": images_list, "videos": videos_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX}
+    csv_sources = [e["file"] for e in CSV_SOURCES.get(prefix.rstrip("/") + "/", [])]
+    return {"images": images_list, "videos": videos_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX, "common_prefixes": COMMON_PREFIXES, "csv_sources": csv_sources}
 
 
 @app.post("/api/upload", dependencies=[Depends(require_api_key)])
@@ -728,6 +795,57 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
         raise HTTPException(status_code=500, detail=f"Unexpected server error during upload: {e}")
 
 
+@app.post("/api/content/sync-csv", dependencies=[Depends(require_api_key)])
+async def sync_csv(prefix: str):
+    """Re-download the CSV exports configured for `prefix` from Google Sheets and
+    overwrite the matching files in R2. Fetches first, then uploads, so a failed
+    download never clobbers the live file."""
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+
+    key = prefix.rstrip("/") + "/"
+    entries = CSV_SOURCES.get(key)
+    if not entries:
+        raise HTTPException(status_code=404, detail=f"No spreadsheet sources configured for prefix '{key}'")
+
+    updated: list = []
+    errors: list = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        for e in entries:
+            url = f"https://docs.google.com/spreadsheets/d/{e['id']}/export?format=csv&gid={e['gid']}"
+            try:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    errors.append({"file": e["file"], "error": f"HTTP {resp.status_code}"})
+                    continue
+                # A private sheet redirects to an HTML login page instead of CSV.
+                if "text/html" in resp.headers.get("content-type", "").lower():
+                    errors.append({"file": e["file"], "error": "Got HTML, not CSV — is the sheet link-accessible?"})
+                    continue
+                body = resp.content
+                if not body:
+                    errors.append({"file": e["file"], "error": "Empty response"})
+                    continue
+            except Exception as ex:
+                errors.append({"file": e["file"], "error": str(ex)})
+                continue
+            try:
+                await asyncio.to_thread(
+                    s3.put_object,
+                    Bucket=R2_BUCKET_NAME,
+                    Key=f"{key}{e['file']}",
+                    Body=body,
+                    ContentType="text/csv",
+                )
+                updated.append(e["file"])
+            except Exception as ex:
+                errors.append({"file": e["file"], "error": f"upload failed: {ex}"})
+
+    if errors and not updated:
+        raise HTTPException(status_code=502, detail="; ".join(f"{x['file']}: {x['error']}" for x in errors))
+    return {"status": "success", "updated": updated, "errors": errors}
+
+
 @app.delete("/api/content", dependencies=[Depends(require_api_key)])
 async def delete_content(key: str):
     if not S3_CONFIGURED:
@@ -761,6 +879,146 @@ async def bulk_delete_content(req: BulkDeleteRequest):
         return {"deleted": deleted, "errors": errors}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------- Scheduled (delayed) deletion ----------------
+
+
+def _list_scheduled_deletes_sync(prefix: str | None = None) -> list:
+    """Return all pending scheduled-delete records, newest due first. When
+    `prefix` is given, only records whose target prefix matches are returned."""
+    records: list = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith(".json"):
+                continue
+            try:
+                body = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)["Body"].read()
+                rec = json.loads(body)
+            except Exception:
+                continue
+            if prefix and rec.get("prefix") != prefix:
+                continue
+            rec["storage_key"] = key
+            records.append(rec)
+    records.sort(key=lambda r: r.get("due_at", ""))
+    return records
+
+
+def _find_scheduled_delete_key(sid: str) -> str | None:
+    """Locate a marker object by its id (embedded in the key), without reading bodies."""
+    suffix = f"__{sid}.json"
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(suffix):
+                return obj["Key"]
+    return None
+
+
+def _run_due_deletions_sync() -> int:
+    """Delete the target objects of every marker whose due time has passed, then
+    remove the marker. Returns the number of markers executed."""
+    now_compact = datetime.now(timezone.utc).strftime(_DUE_FMT)
+    executed = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            name = key[len(SCHEDULED_DELETE_PREFIX):]
+            due_compact = name.split("__", 1)[0]
+            # Fixed-width sortable stamp -> lexical compare is chronological.
+            if due_compact > now_compact:
+                continue
+            try:
+                body = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)["Body"].read()
+                rec = json.loads(body)
+            except Exception:
+                logger.exception("Skipping unreadable scheduled-delete marker %s", key)
+                continue
+            target_keys = [k for k in rec.get("keys", []) if k]
+            if target_keys:
+                try:
+                    s3.delete_objects(
+                        Bucket=R2_BUCKET_NAME,
+                        Delete={"Objects": [{"Key": k} for k in target_keys], "Quiet": True},
+                    )
+                except Exception:
+                    logger.exception("Failed deleting targets for scheduled delete %s", rec.get("id"))
+                    continue
+            s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+            executed += 1
+            logger.info("Executed scheduled deletion %s (%d object(s))", rec.get("id"), len(target_keys))
+    return executed
+
+
+async def _scheduled_delete_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(SCHEDULED_DELETE_POLL_SECONDS)
+            await asyncio.to_thread(_run_due_deletions_sync)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scheduled-delete sweep iteration failed")
+
+
+@app.post("/api/content/schedule-delete", dependencies=[Depends(require_api_key)])
+async def schedule_delete(req: ScheduleDeleteRequest):
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+    keys = [k for k in req.keys if k]
+    if not keys:
+        raise HTTPException(status_code=400, detail="No keys to delete")
+    if len(keys) > 1000:
+        raise HTTPException(status_code=400, detail="Cannot schedule more than 1000 keys per request")
+    if not (MIN_DELETE_DELAY_SECONDS <= req.delay_seconds <= MAX_DELETE_DELAY_SECONDS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"delay_seconds must be between {MIN_DELETE_DELAY_SECONDS} and {MAX_DELETE_DELAY_SECONDS}",
+        )
+
+    now = datetime.now(timezone.utc)
+    due = now + timedelta(seconds=req.delay_seconds)
+    sid = secrets.token_hex(8)
+    record = {
+        "id": sid,
+        "prefix": req.prefix or "",
+        "label": req.label or "",
+        "keys": keys,
+        "due_at": due.isoformat().replace("+00:00", "Z"),
+        "created_at": now.isoformat().replace("+00:00", "Z"),
+    }
+    storage_key = f"{SCHEDULED_DELETE_PREFIX}{due.strftime(_DUE_FMT)}__{sid}.json"
+    await asyncio.to_thread(
+        s3.put_object,
+        Bucket=R2_BUCKET_NAME,
+        Key=storage_key,
+        Body=json.dumps(record).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return {"status": "scheduled", "id": sid, "due_at": record["due_at"]}
+
+
+@app.get("/api/scheduled-deletes", dependencies=[Depends(require_api_key)])
+async def list_scheduled_deletes(prefix: str | None = None):
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+    records = await asyncio.to_thread(_list_scheduled_deletes_sync, prefix)
+    return {"scheduled": records}
+
+
+@app.delete("/api/scheduled-deletes/{sid}", dependencies=[Depends(require_api_key)])
+async def cancel_scheduled_delete(sid: str):
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+    key = await asyncio.to_thread(_find_scheduled_delete_key, sid)
+    if not key:
+        raise HTTPException(status_code=404, detail="Scheduled deletion not found")
+    await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=key)
+    return {"status": "cancelled", "id": sid}
 
 
 # ---------------- Public endpoints ----------------

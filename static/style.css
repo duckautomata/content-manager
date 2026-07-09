@@ -192,6 +192,23 @@ h1 {
     width: 150px;
 }
 
+#prefix-presets {
+    background: transparent;
+    border: none;
+    border-left: 1px solid var(--glass-border);
+    padding-left: 0.75rem;
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 0.9rem;
+    outline: none;
+    cursor: pointer;
+}
+
+#prefix-presets option {
+    background: var(--bg-color);
+    color: var(--text-main);
+}
+
 /* Buttons */
 .btn {
     display: inline-flex;
@@ -248,9 +265,60 @@ h1 {
     border-radius: 50%;
 }
 
-#refresh-btn svg {
+#refresh-btn svg,
+#sync-sheet-btn svg {
     width: 16px;
     height: 16px;
+}
+
+#data-files-section .section-header #sync-sheet-btn {
+    margin-left: auto;
+}
+
+/* Delayed-delete picker + scheduled markers */
+.confirm-delay-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.5rem 0 0.25rem;
+}
+
+.confirm-delay-row select {
+    background: var(--bg-color);
+    color: var(--text-main);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    padding: 0.4rem 0.6rem;
+    font-family: inherit;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
+.sched-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    background: rgba(240, 173, 78, 0.18);
+    color: #f0ad4e;
+    border: 1px solid rgba(240, 173, 78, 0.4);
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.image-card .sched-badge {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    z-index: 2;
+    backdrop-filter: blur(4px);
+}
+
+.image-card.scheduled,
+.list-item.scheduled {
+    outline: 1px solid rgba(240, 173, 78, 0.5);
 }
 
 /* Dropzone */
@@ -661,6 +729,29 @@ main {
 
 .spinner {
     animation: spin 1s linear infinite;
+}
+
+.btn:disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.action-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+    color: var(--text-muted);
+}
+
+.btn-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid currentColor;
+    border-top-color: transparent;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
 }
 
 /* ---------------- Suggestions page ---------------- */
