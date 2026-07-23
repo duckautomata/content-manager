@@ -874,6 +874,10 @@ main {
     border-left: 3px solid var(--accent-2);
 }
 
+.suggestion-card.status-completed {
+    border-left: 3px solid #3b82f6;
+}
+
 .suggestion-card.focus-flash {
     box-shadow: 0 0 0 2px var(--accent-1), 0 8px 32px 0 rgba(0, 0, 0, 0.3);
 }
@@ -977,6 +981,30 @@ main {
     background: rgba(220, 38, 38, 0.2);
     color: #fca5a5;
     border: 1px solid rgba(220, 38, 38, 0.5);
+}
+
+.status-pill.status-completed {
+    background: rgba(59, 130, 246, 0.2);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.5);
+}
+
+.feedback-text {
+    background: rgba(59, 130, 246, 0.08);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
+    color: var(--text-main);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 200px;
+    overflow-y: auto;
+}
+
+.feedback-editor {
+    font-family: inherit;
+    min-height: 120px;
 }
 
 .suggestion-actions {

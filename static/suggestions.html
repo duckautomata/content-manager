@@ -29,6 +29,7 @@
                         <select id="status-filter">
                             <option value="pending" selected>Pending</option>
                             <option value="approved">Approved</option>
+                            <option value="completed">Completed</option>
                             <option value="rejected">Rejected</option>
                             <option value="">All</option>
                         </select>
@@ -89,6 +90,27 @@
                     <div class="modal-actions">
                         <button id="edit-cancel-btn" class="btn secondary-btn">Cancel</button>
                         <button id="edit-save-btn" class="btn primary-btn">Save</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Admin Feedback Modal -->
+    <div id="feedback-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel">
+            <button class="close-modal-btn" id="feedback-close-btn">&times;</button>
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3>Admin Feedback</h3>
+                    <p class="modal-meta" id="feedback-id"></p>
+                    <textarea id="feedback-text" class="json-editor feedback-editor" spellcheck="true"
+                        placeholder="Feedback shown to the suggester when they check this suggestion's status."></textarea>
+                    <p id="feedback-error" class="login-error"></p>
+                    <div class="modal-actions">
+                        <button id="feedback-cancel-btn" class="btn secondary-btn">Cancel</button>
+                        <button id="feedback-save-btn" class="btn primary-btn">Save</button>
                     </div>
                 </div>
             </div>

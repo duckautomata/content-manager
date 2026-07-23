@@ -44,6 +44,14 @@ const editCloseBtn = document.getElementById('edit-close-btn');
 const editCancelBtn = document.getElementById('edit-cancel-btn');
 const editSaveBtn = document.getElementById('edit-save-btn');
 
+const feedbackModal = document.getElementById('feedback-modal');
+const feedbackText = document.getElementById('feedback-text');
+const feedbackIdEl = document.getElementById('feedback-id');
+const feedbackError = document.getElementById('feedback-error');
+const feedbackCloseBtn = document.getElementById('feedback-close-btn');
+const feedbackCancelBtn = document.getElementById('feedback-cancel-btn');
+const feedbackSaveBtn = document.getElementById('feedback-save-btn');
+
 const confirmModal = document.getElementById('confirm-modal');
 const confirmTitle = document.getElementById('confirm-title');
 const confirmMessage = document.getElementById('confirm-message');
@@ -240,7 +248,7 @@ function renderTabs() {
         return;
     }
     for (const site of sites) {
-        const counts = state.counts[site] || { pending: 0, approved: 0, rejected: 0 };
+        const counts = state.counts[site] || { pending: 0, approved: 0, rejected: 0, completed: 0 };
         const tab = document.createElement('button');
         tab.className = `site-tab${site === state.site ? ' active' : ''}`;
         tab.innerHTML = `<span>${site}</span><span class="tab-badge${counts.pending ? ' has-pending' : ''}">${counts.pending}</span>`;
@@ -315,6 +323,7 @@ function renderCard(s) {
     card.dataset.id = s.id;
 
     const isPending = s.status === 'pending';
+    const isApproved = s.status === 'approved';
     const submitted = s.submitted_at ? new Date(s.submitted_at).toLocaleString() : '';
     const kindLabel = KIND_LABEL[s.kind] || s.kind;
 
@@ -336,6 +345,8 @@ function renderCard(s) {
                 <button class="btn secondary-btn reject-btn">Reject</button>
                 <button class="btn secondary-btn edit-btn">Edit</button>
             ` : ''}
+            ${isApproved ? `<button class="btn primary-btn complete-btn">Complete</button>` : ''}
+            <button class="btn secondary-btn feedback-btn">Feedback</button>
             <button class="btn danger-btn delete-btn">Delete</button>
         </div>
     `;
@@ -343,6 +354,16 @@ function renderCard(s) {
 
     const body = document.createElement('div');
     body.className = 'suggestion-body';
+
+    if (s.admin_context) {
+        const feedbackBlock = document.createElement('div');
+        feedbackBlock.className = 'feedback-block';
+        feedbackBlock.innerHTML = `
+            <div class="block-label">Admin Feedback</div>
+            <p class="feedback-text">${escapeHtml(s.admin_context)}</p>
+        `;
+        body.appendChild(feedbackBlock);
+    }
 
     const payloadBlock = document.createElement('div');
     payloadBlock.className = 'payload-block';
@@ -374,6 +395,10 @@ function renderCard(s) {
         head.querySelector('.reject-btn').addEventListener('click', () => rejectSuggestion(s));
         head.querySelector('.edit-btn').addEventListener('click', () => openEditModal(s));
     }
+    if (isApproved) {
+        head.querySelector('.complete-btn').addEventListener('click', () => completeSuggestion(s));
+    }
+    head.querySelector('.feedback-btn').addEventListener('click', () => openFeedbackModal(s));
     head.querySelector('.delete-btn').addEventListener('click', () => deleteSuggestion(s));
 
     return card;
@@ -563,6 +588,33 @@ async function rejectSuggestion(s) {
     }
 }
 
+async function completeSuggestion(s) {
+    const ok = await confirmAction({
+        title: 'Mark completed',
+        message: `Mark ${s.id} as completed? This tells the suggester the approved change is done and live.`,
+        confirmText: 'Complete',
+        danger: false,
+    });
+    if (!ok) return;
+    const revert = setCardBusy(s, 'Completing…');
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(s.id)}/status`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'completed' }),
+        });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || `HTTP ${res.status}`);
+        }
+        toast(`Completed ${s.id}`, 'success');
+        refresh();
+    } catch (e) {
+        revert();
+        if (e.message !== 'Unauthorized') toast(`Complete failed: ${e.message}`, 'error');
+    }
+}
+
 async function deleteSuggestion(s) {
     const liveCount = (s.images || []).filter(i => i.status === 'approved').length;
     const pendingCount = (s.images || []).filter(i => i.status !== 'approved').length;
@@ -662,9 +714,55 @@ editSaveBtn.addEventListener('click', async () => {
     }
 });
 
+// ---------------- Feedback modal ----------------
+
+let feedbackId = null;
+
+function openFeedbackModal(s) {
+    feedbackId = s.id;
+    feedbackIdEl.textContent = s.id;
+    feedbackText.value = s.admin_context || '';
+    feedbackError.textContent = '';
+    feedbackModal.classList.remove('hidden');
+    setTimeout(() => feedbackText.focus(), 50);
+}
+
+function closeFeedbackModal() {
+    feedbackModal.classList.add('hidden');
+    feedbackId = null;
+}
+
+feedbackCloseBtn.addEventListener('click', closeFeedbackModal);
+feedbackCancelBtn.addEventListener('click', closeFeedbackModal);
+feedbackModal.querySelector('.modal-backdrop').addEventListener('click', closeFeedbackModal);
+
+feedbackSaveBtn.addEventListener('click', async () => {
+    if (feedbackId === null) return;
+    feedbackSaveBtn.disabled = true;
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(feedbackId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ admin_context: feedbackText.value.trim() }),
+        });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || `HTTP ${res.status}`);
+        }
+        toast('Feedback saved', 'success');
+        closeFeedbackModal();
+        refresh();
+    } catch (e) {
+        if (e.message !== 'Unauthorized') feedbackError.textContent = e.message;
+    } finally {
+        feedbackSaveBtn.disabled = false;
+    }
+});
+
 document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!editModal.classList.contains('hidden')) closeEditModal();
+    else if (!feedbackModal.classList.contains('hidden')) closeFeedbackModal();
     else if (!imageModal.classList.contains('hidden')) closeImageModal();
 });
 

@@ -100,6 +100,9 @@ You can view the image on Dockerhub:
 The easiest way to run the docker image is to
 1. copy [docker-compose.yml](./docker-compose.yml) and create an `.env` file in a folder where you want to run it.
 2. Ensure your `.env` file is properly configured.
+   The compose file mounts `./data` into the container for the suggestion
+   database (SQLite) — back this folder up and keep the mount, or suggestions
+   are lost when the container is recreated.
 3. Start the containers:
    ```bash
    docker compose up -d
@@ -146,24 +149,38 @@ The server hosts a small public API so external sites can suggest content change
 
 All public endpoints require a Cloudflare Turnstile token. CORS is restricted to `https://www.duck-automata.com` (and localhost when `ENVIRONMENT=development`).
 
-| Method | Path                       | Body                                                                   | Returns                                          |
-|--------|----------------------------|------------------------------------------------------------------------|--------------------------------------------------|
-| GET    | `/api/public/config`       | —                                                                      | `{turnstile_site_key, allowed_sites, max_image_bytes, supported_formats, public_url_prefix, pending_prefix}` |
-| POST   | `/api/public/image`        | multipart: `cf_turnstile_response`, `file`                             | `{id, ext, urls: {original, preview, thumbnail}}` |
-| POST   | `/api/public/suggestion`   | json: `{cf_turnstile_response, site, kind, payload, image_ids}`        | `{id}` (201)                                     |
+| Method | Path                            | Body / Query                                                           | Returns                                          |
+|--------|---------------------------------|------------------------------------------------------------------------|--------------------------------------------------|
+| GET    | `/api/public/config`            | —                                                                      | `{turnstile_site_key, allowed_sites, max_image_bytes, supported_formats, public_url_prefix, pending_prefix}` |
+| POST   | `/api/public/image`             | multipart: `cf_turnstile_response`, `file`                             | `{id, ext, urls: {original, preview, thumbnail}}` |
+| POST   | `/api/public/suggestion`        | json: `{cf_turnstile_response, site, kind, payload, image_ids}`        | `{id}` (201)                                     |
+| GET    | `/api/public/suggestions`       | query: `ids=sug_a,sug_b` (comma-separated, max 50)                     | `{suggestions: [{id, site, kind, status, submitted_at, updated_at, admin_context}], not_found: [...]}` |
+
+The status-lookup endpoint needs no Turnstile token or auth: suggestion ids are
+unguessable tokens handed out only at submission time, so knowing an id is the
+access capability. Suggester sites should tell users to save their id (or store
+it in localStorage) so they can check progress and read any admin feedback
+(`admin_context`) later.
 
 **Suggestion `kind`:**
 - `new` — adding a new entity (e.g., a new emote)
 - `edit` — editing an existing entity (replace/remove images, change fields, etc.)
 - `delete` — requesting deletion of an entity
 
-**Storage layout:**
+**Suggestion `status`:**
+- `pending` — awaiting admin review
+- `approved` — accepted; images moved to the live prefix (work may still be in progress)
+- `completed` — approved *and* the change is done/live on the site
+- `rejected` — declined
+
+**Storage:**
+
+Suggestion records live in a local SQLite database (`DB_PATH`, default
+`data/suggestions.db`; mounted as the `./data` volume in docker-compose). Image
+files stay in R2:
 
 ```
 _suggestions/
-  {site}/
-    {status}/                          # pending | approved | rejected
-      {submitted_at}__{sug_id}.json    # one suggestion per file; site+status live in the key
   _pending/
     {img_id}.{ext}                     # original (TTL'd 30d)
     {img_id}_p.webp                    # preview
@@ -175,15 +192,13 @@ _suggestions/
   {img_id}_t.webp
 ```
 
-Encoding `site`/`status`/`submitted_at` in the key lets `/counts` and the list
-endpoint work from key listings alone (no per-object reads), so they scale to tens
-of thousands of suggestions. Approving, rejecting, or editing a suggestion moves
-the object to its new key. Legacy flat-layout files (`_suggestions/{id}.json`) are
-migrated into this layout automatically on startup.
+On startup, any suggestion JSON objects still in R2 (legacy `_suggestions/{id}.json`
+or `_suggestions/{site}/{status}/...json` layouts) are imported into the database
+and then removed from the bucket.
 
 ### R2 lifecycle rule
 
-Set a 30-day delete rule on the prefix `_suggestions/_pending/`. The suggestion JSON files (under `_suggestions/{site}/{status}/`) will not match and stay forever as an audit trail. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days.
+Set a 30-day delete rule on the prefix `_suggestions/_pending/`. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days. Suggestion records themselves are in the local database, not R2, so they are unaffected and kept forever as an audit trail.
 
 ### Cloudflare Turnstile setup
 
@@ -210,10 +225,10 @@ Cloudflare dashboard → **Security → WAF → Rate limiting rules** → Create
 | Method | Path                                                       | Purpose                                                  |
 |--------|------------------------------------------------------------|----------------------------------------------------------|
 | GET    | `/api/suggestions?site=&status=&limit=`                    | List newest-first (filters optional; `limit` default 200, max 1000). Returns `{suggestions, total, truncated}` |
-| GET    | `/api/suggestions/counts`                                  | `{site: {pending, approved, rejected}}` for tabs         |
+| GET    | `/api/suggestions/counts`                                  | `{site: {pending, approved, rejected, completed}}` for tabs |
 | GET    | `/api/suggestions/{id}`                                    | Get single suggestion                                    |
-| PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending)    |
-| PATCH  | `/api/suggestions/{id}/status`                             | `{status: "approved" \| "rejected"}` — approve moves images to live prefix |
+| PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending). `admin_context` (feedback shown to the suggester) is editable at any time. |
+| PATCH  | `/api/suggestions/{id}/status`                             | `{status: "approved" \| "rejected" \| "completed"}` — approve moves images to live prefix; only approved suggestions can be completed |
 | DELETE | `/api/suggestions/{id}/images/{imgId}`                     | Reject one image (deletes pending files; only while suggestion is pending) |
 | DELETE | `/api/suggestions/{id}`                                    | Delete suggestion + non-approved pending images          |
 

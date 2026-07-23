@@ -5,6 +5,10 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      # Local suggestion database (SQLite). Keep this mounted or suggestions
+      # are lost when the container is recreated.
+      - ./data:/app/data
     networks:
       - content-network
     restart: unless-stopped
