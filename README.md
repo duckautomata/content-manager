@@ -153,14 +153,27 @@ All public endpoints require a Cloudflare Turnstile token. CORS is restricted to
 |--------|---------------------------------|------------------------------------------------------------------------|--------------------------------------------------|
 | GET    | `/api/public/config`            | —                                                                      | `{turnstile_site_key, allowed_sites, max_image_bytes, supported_formats, public_url_prefix, pending_prefix}` |
 | POST   | `/api/public/image`             | multipart: `cf_turnstile_response`, `file`                             | `{id, ext, urls: {original, preview, thumbnail}}` |
-| POST   | `/api/public/suggestion`        | json: `{cf_turnstile_response, site, kind, payload, image_ids}`        | `{id}` (201)                                     |
-| GET    | `/api/public/suggestions`       | query: `ids=sug_a,sug_b` (comma-separated, max 50)                     | `{suggestions: [{id, site, kind, status, submitted_at, updated_at, admin_context}], not_found: [...]}` |
+| POST   | `/api/public/suggestion`        | json: `{cf_turnstile_response, site, kind, payload, image_ids, summary}` | `{id}` (201)                               |
+| GET    | `/api/public/suggestions/{site}` | query: `ids=sug_a,sug_b` (comma-separated, max 50)                    | `{suggestions: [{id, site, kind, status, summary, submitted_at, updated_at, admin_context}], not_found: [...]}` |
 
 The status-lookup endpoint needs no Turnstile token or auth: suggestion ids are
 unguessable tokens handed out only at submission time, so knowing an id is the
 access capability. Suggester sites should tell users to save their id (or store
 it in localStorage) so they can check progress and read any admin feedback
 (`admin_context`) later.
+
+The `{site}` path segment scopes the lookup: ids belonging to a different site
+come back in `not_found`, so a site can pass its whole saved id list without
+surfacing another site's suggestions. An unknown site is a `404`.
+
+`summary` is a short (≤300 char) human-readable line describing what the
+suggestion asked for, so the submitter can tell their suggestions apart. The
+submitting site should send it; when omitted, the server derives one from the
+`kind` plus a `name`/`title`/`label`/`display_name`/`slug`/`id` key in the
+payload (e.g. `"Add pogduck"`). Admins can rewrite it at any time — in any
+status — with the **Summary** button on a card at `/suggestions.html`, or
+via `PATCH /api/suggestions/{id}`. Saving an empty value re-derives it from the
+current payload.
 
 **Suggestion `kind`:**
 - `new` — adding a new entity (e.g., a new emote)
@@ -227,7 +240,8 @@ Cloudflare dashboard → **Security → WAF → Rate limiting rules** → Create
 | GET    | `/api/suggestions?site=&status=&limit=`                    | List newest-first (filters optional; `limit` default 200, max 1000). Returns `{suggestions, total, truncated}` |
 | GET    | `/api/suggestions/counts`                                  | `{site: {pending, approved, rejected, completed}}` for tabs |
 | GET    | `/api/suggestions/{id}`                                    | Get single suggestion                                    |
-| PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending). `admin_context` (feedback shown to the suggester) is editable at any time. |
+| GET    | `/api/suggestions/{id}/images.zip`                         | All the suggestion's original image files as one zip, each entry named `{image_id}{ext}`. Missing files are skipped and listed in the `X-Skipped-Images` header. |
+| PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending). `admin_context` (feedback shown to the suggester) and `summary` are editable at any time. |
 | PATCH  | `/api/suggestions/{id}/status`                             | `{status: "approved" \| "rejected" \| "completed"}` — approve moves images to live prefix; only approved suggestions can be completed |
 | DELETE | `/api/suggestions/{id}/images/{imgId}`                     | Reject one image (deletes pending files; only while suggestion is pending) |
 | DELETE | `/api/suggestions/{id}`                                    | Delete suggestion + non-approved pending images          |

@@ -7,6 +7,8 @@ import os
 import re
 import secrets
 import sqlite3
+import tempfile
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -16,6 +18,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -85,10 +88,15 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 ADMIN_URL = os.environ.get("ADMIN_URL", "")
 IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS = int(os.environ.get("IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS", "600"))
 
-MAX_PUBLIC_UPLOAD_BYTES = 25 * 1024 * 1024
+MAX_PUBLIC_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_PUBLIC_PAYLOAD_BYTES = 10 * 1024 * 1024
 MAX_SUGGESTION_IMAGE_IDS = 1000
 MAX_PUBLIC_STATUS_IDS = 50
+MAX_SUGGESTION_SUMMARY_CHARS = 300
+# Bulk image download: keep small zips in memory, spill bigger ones to disk, and
+# refuse absurd ones outright rather than filling the container's disk.
+SUGGESTION_ZIP_SPOOL_BYTES = 64 * 1024 * 1024
+SUGGESTION_ZIP_MAX_BYTES = 1024 * 1024 * 1024
 SUGGESTIONS_PAGE_LIMIT = 200
 DB_PATH = os.environ.get("DB_PATH", "data/suggestions.db")
 SUGGESTIONS_PREFIX = "_suggestions/"
@@ -359,6 +367,7 @@ def _init_db() -> None:
                     payload TEXT NOT NULL DEFAULT '{}',
                     images TEXT NOT NULL DEFAULT '[]',
                     admin_context TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT '',
                     submitted_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -368,6 +377,12 @@ def _init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_suggestions_site_status"
                 " ON suggestions (site, status, submitted_at)"
             )
+            # Added after the table shipped; older databases need the column.
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(suggestions)")}
+            if "summary" not in columns:
+                conn.execute(
+                    "ALTER TABLE suggestions ADD COLUMN summary TEXT NOT NULL DEFAULT ''"
+                )
     finally:
         conn.close()
 
@@ -375,15 +390,40 @@ def _init_db() -> None:
 _init_db()
 
 
+# Payload keys, in priority order, that tend to name the thing a suggestion is
+# about. Only consulted when the submitting site sent no summary.
+_SUMMARY_PAYLOAD_KEYS = ("name", "title", "label", "display_name", "slug", "id")
+_SUMMARY_VERBS = {"new": "Add", "edit": "Edit", "delete": "Delete"}
+_SUMMARY_FALLBACKS = {
+    "new": "Add a new item",
+    "edit": "Edit an existing item",
+    "delete": "Delete an item",
+}
+
+
+def _derive_summary(kind: str, payload: dict) -> str:
+    """Best-effort one-liner for suggestions stored without a summary
+    (rows predating the field, or sites that don't send one)."""
+    for key in _SUMMARY_PAYLOAD_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            verb = _SUMMARY_VERBS.get(kind, kind)
+            return f"{verb} {value.strip()}"[:MAX_SUGGESTION_SUMMARY_CHARS]
+    return _SUMMARY_FALLBACKS.get(kind, f"{kind} suggestion")
+
+
 def _row_to_suggestion(row: sqlite3.Row) -> dict:
+    payload = json.loads(row["payload"])
+    kind = row["kind"]
     return {
         "id": row["id"],
         "site": row["site"],
-        "kind": row["kind"],
+        "kind": kind,
         "status": row["status"],
-        "payload": json.loads(row["payload"]),
+        "payload": payload,
         "images": json.loads(row["images"]),
         "admin_context": row["admin_context"],
+        "summary": row["summary"] or _derive_summary(kind, payload),
         "submitted_at": row["submitted_at"],
         "updated_at": row["updated_at"],
     }
@@ -398,14 +438,15 @@ def _suggestion_row_params(s: dict) -> dict:
         "payload": json.dumps(s.get("payload", {})),
         "images": json.dumps(s.get("images", [])),
         "admin_context": s.get("admin_context", ""),
+        "summary": s.get("summary", ""),
         "submitted_at": s["submitted_at"],
         "updated_at": s.get("updated_at") or s["submitted_at"],
     }
 
 
 _SUGGESTION_COLUMNS_SQL = (
-    "(id, site, kind, status, payload, images, admin_context, submitted_at, updated_at)"
-    " VALUES (:id, :site, :kind, :status, :payload, :images, :admin_context, :submitted_at, :updated_at)"
+    "(id, site, kind, status, payload, images, admin_context, summary, submitted_at, updated_at)"
+    " VALUES (:id, :site, :kind, :status, :payload, :images, :admin_context, :summary, :submitted_at, :updated_at)"
 )
 _SUGGESTION_UPSERT_SQL = f"""
     INSERT INTO suggestions {_SUGGESTION_COLUMNS_SQL}
@@ -416,6 +457,7 @@ _SUGGESTION_UPSERT_SQL = f"""
         payload = excluded.payload,
         images = excluded.images,
         admin_context = excluded.admin_context,
+        summary = excluded.summary,
         updated_at = excluded.updated_at
 """
 _SUGGESTION_INSERT_IGNORE_SQL = f"INSERT OR IGNORE INTO suggestions {_SUGGESTION_COLUMNS_SQL}"
@@ -564,6 +606,47 @@ def _find_pending_image_ext_sync(image_id: str) -> str | None:
     return None
 
 
+def _image_object_key(img: dict) -> str:
+    """Bucket key of an image's original file. Approved images have been moved
+    out of the pending prefix into the site's live prefix."""
+    if img.get("status") == "approved" and img.get("moved_to"):
+        return img["moved_to"]
+    return f"{PENDING_PREFIX}{img['id']}{img['ext']}"
+
+
+def _zip_suggestion_images_sync(images: list[dict]) -> tuple[tempfile.SpooledTemporaryFile, list[str]]:
+    """Zip every image's original file, each entry named `{image_id}{ext}`.
+    Objects that are gone — pending uploads past the bucket's 30-day TTL, say —
+    are skipped and their ids returned alongside the archive."""
+    spool = tempfile.SpooledTemporaryFile(max_size=SUGGESTION_ZIP_SPOOL_BYTES)
+    skipped: list[str] = []
+    total = 0
+    try:
+        # Stored, not deflated: these are already-compressed webp/jpeg/video
+        # bytes, so compressing again costs CPU for no meaningful size win.
+        with zipfile.ZipFile(spool, "w", zipfile.ZIP_STORED) as zf:
+            for img in images:
+                key = _image_object_key(img)
+                try:
+                    body = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)["Body"].read()
+                except Exception:
+                    logger.warning("Skipping missing image object %s", key)
+                    skipped.append(img["id"])
+                    continue
+                total += len(body)
+                if total > SUGGESTION_ZIP_MAX_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Images exceed the {SUGGESTION_ZIP_MAX_BYTES // (1024 ** 3)} GB download limit",
+                    )
+                zf.writestr(f"{img['id']}{img['ext']}", body)
+        spool.seek(0)
+        return spool, skipped
+    except Exception:
+        spool.close()
+        raise
+
+
 # ---------------- Turnstile ----------------
 
 def _client_ip(request: Request) -> str | None:
@@ -707,6 +790,8 @@ async def _notify_discord(suggestion: dict, sample_image_url: str | None) -> Non
             {"name": "Payload", "value": f"```json\n{payload_str}\n```"},
         ],
     }
+    if summary := suggestion.get("summary"):
+        embed["description"] = summary
     if review_url:
         embed["url"] = review_url
     if sample_image_url:
@@ -738,6 +823,9 @@ class PublicSuggestionRequest(BaseModel):
     kind: Literal["new", "edit", "delete"]
     payload: dict = Field(default_factory=dict)
     image_ids: list[str] = Field(default_factory=list, max_length=MAX_SUGGESTION_IMAGE_IDS)
+    # Short human-readable summary shown back to the submitter on status lookup.
+    # Derived from the payload when the site omits it.
+    summary: str = Field(default="", max_length=MAX_SUGGESTION_SUMMARY_CHARS)
 
     @field_validator("payload")
     @classmethod
@@ -754,6 +842,7 @@ class SuggestionEditRequest(BaseModel):
     kind: Literal["new", "edit", "delete"] | None = None
     site: str | None = None
     admin_context: str | None = Field(default=None, max_length=5000)
+    summary: str | None = Field(default=None, max_length=MAX_SUGGESTION_SUMMARY_CHARS)
 
 
 class SuggestionStatusRequest(BaseModel):
@@ -1188,6 +1277,7 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
         "payload": req.payload,
         "images": images,
         "admin_context": "",
+        "summary": req.summary.strip() or _derive_summary(req.kind, req.payload),
         "submitted_at": _utc_now_iso(),
     }
     await _write_suggestion(suggestion)
@@ -1202,11 +1292,16 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
     return {"id": sid}
 
 
-@app.get("/api/public/suggestions")
-async def public_suggestion_status(ids: str):
+@app.get("/api/public/suggestions/{site}")
+async def public_suggestion_status(site: str, ids: str):
     """Status lookup for submitters who saved their suggestion id(s). Ids are
     unguessable tokens handed out at submission time and act as the access
-    capability, so reads need no captcha or auth. `ids` is comma-separated."""
+    capability, so reads need no captcha or auth. `ids` is comma-separated.
+    Ids belonging to another site are reported as not found, so a site can hand
+    the endpoint its whole saved id list without surfacing another site's data."""
+    if site not in ALLOWED_SITES:
+        raise HTTPException(status_code=404, detail=f"Unknown site: {site}")
+
     id_list = list(dict.fromkeys(i.strip() for i in ids.split(",") if i.strip()))
     if not id_list:
         raise HTTPException(status_code=400, detail="No ids provided")
@@ -1215,13 +1310,18 @@ async def public_suggestion_status(ids: str):
     for sid in id_list:
         _validate_id(sid, "suggestion")
 
-    found = {s["id"]: s for s in await asyncio.to_thread(_read_suggestions_bulk_sync, id_list)}
+    found = {
+        s["id"]: s
+        for s in await asyncio.to_thread(_read_suggestions_bulk_sync, id_list)
+        if s["site"] == site
+    }
     suggestions = [
         {
             "id": s["id"],
             "site": s["site"],
             "kind": s["kind"],
             "status": s["status"],
+            "summary": s["summary"],
             "submitted_at": s["submitted_at"],
             "updated_at": s["updated_at"],
             "admin_context": s["admin_context"],
@@ -1263,6 +1363,40 @@ async def get_suggestion(suggestion_id: str):
     return s
 
 
+@app.get("/api/suggestions/{suggestion_id}/images.zip", dependencies=[Depends(require_api_key)])
+async def download_suggestion_images(suggestion_id: str):
+    """All of a suggestion's original image files in one archive, each entry
+    named after its image id. Ids whose files no longer exist are listed in the
+    X-Skipped-Images response header rather than failing the download."""
+    _validate_id(suggestion_id, "suggestion")
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+
+    s = await _read_suggestion(suggestion_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Suggestion not found")
+    images = s.get("images", [])
+    if not images:
+        raise HTTPException(status_code=404, detail="Suggestion has no images")
+
+    spool, skipped = await asyncio.to_thread(_zip_suggestion_images_sync, images)
+    if len(skipped) == len(images):
+        spool.close()
+        raise HTTPException(status_code=404, detail="No image files remain for this suggestion")
+
+    def _stream():
+        try:
+            while chunk := spool.read(256 * 1024):
+                yield chunk
+        finally:
+            spool.close()
+
+    headers = {"Content-Disposition": f'attachment; filename="{suggestion_id}.zip"'}
+    if skipped:
+        headers["X-Skipped-Images"] = ",".join(skipped)
+    return StreamingResponse(_stream(), media_type="application/zip", headers=headers)
+
+
 @app.patch("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
 async def edit_suggestion(suggestion_id: str, req: SuggestionEditRequest):
     _validate_id(suggestion_id, "suggestion")
@@ -1282,9 +1416,14 @@ async def edit_suggestion(suggestion_id: str, req: SuggestionEditRequest):
         if req.site not in ALLOWED_SITES:
             raise HTTPException(status_code=400, detail=f"Unknown site: {req.site}")
         s["site"] = req.site
-    # Admin feedback is editable at any time, including after finalization.
+    # Admin feedback and the summary are editable at any time, including
+    # after finalization — neither changes what the suggestion asks for.
     if req.admin_context is not None:
         s["admin_context"] = req.admin_context
+    if req.summary is not None:
+        # Clearing it re-derives from the (possibly just-updated) kind/payload,
+        # so the stored summary is never empty.
+        s["summary"] = req.summary.strip() or _derive_summary(s["kind"], s["payload"])
 
     await _write_suggestion(s)
     return s

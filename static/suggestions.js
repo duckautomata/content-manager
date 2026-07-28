@@ -52,6 +52,14 @@ const feedbackCloseBtn = document.getElementById('feedback-close-btn');
 const feedbackCancelBtn = document.getElementById('feedback-cancel-btn');
 const feedbackSaveBtn = document.getElementById('feedback-save-btn');
 
+const summaryModal = document.getElementById('summary-modal');
+const summaryInput = document.getElementById('summary-input');
+const summaryIdEl = document.getElementById('summary-id');
+const summaryError = document.getElementById('summary-error');
+const summaryCloseBtn = document.getElementById('summary-close-btn');
+const summaryCancelBtn = document.getElementById('summary-cancel-btn');
+const summarySaveBtn = document.getElementById('summary-save-btn');
+
 const confirmModal = document.getElementById('confirm-modal');
 const confirmTitle = document.getElementById('confirm-title');
 const confirmMessage = document.getElementById('confirm-message');
@@ -346,6 +354,7 @@ function renderCard(s) {
                 <button class="btn secondary-btn edit-btn">Edit</button>
             ` : ''}
             ${isApproved ? `<button class="btn primary-btn complete-btn">Complete</button>` : ''}
+            <button class="btn secondary-btn summary-btn">Summary</button>
             <button class="btn secondary-btn feedback-btn">Feedback</button>
             <button class="btn danger-btn delete-btn">Delete</button>
         </div>
@@ -354,6 +363,16 @@ function renderCard(s) {
 
     const body = document.createElement('div');
     body.className = 'suggestion-body';
+
+    if (s.summary) {
+        const summaryBlock = document.createElement('div');
+        summaryBlock.className = 'summary-block';
+        summaryBlock.innerHTML = `
+            <div class="block-label">Summary</div>
+            <p class="summary-text">${escapeHtml(s.summary)}</p>
+        `;
+        body.appendChild(summaryBlock);
+    }
 
     if (s.admin_context) {
         const feedbackBlock = document.createElement('div');
@@ -377,7 +396,17 @@ function renderCard(s) {
     if (s.images && s.images.length) {
         const imagesBlock = document.createElement('div');
         imagesBlock.className = 'images-block';
-        imagesBlock.innerHTML = `<div class="block-label">Images (${s.images.length})</div>`;
+        const imagesHead = document.createElement('div');
+        imagesHead.className = 'images-head';
+        imagesHead.innerHTML = `<div class="block-label">Images (${s.images.length})</div>`;
+        if (s.images.length > 1) {
+            const downloadBtn = document.createElement('button');
+            downloadBtn.className = 'btn secondary-btn small download-all-btn';
+            downloadBtn.textContent = 'Download all';
+            downloadBtn.addEventListener('click', () => downloadAllImages(s, downloadBtn));
+            imagesHead.appendChild(downloadBtn);
+        }
+        imagesBlock.appendChild(imagesHead);
         const grid = document.createElement('div');
         grid.className = 'suggestion-images-grid';
         for (const img of s.images) {
@@ -398,6 +427,7 @@ function renderCard(s) {
     if (isApproved) {
         head.querySelector('.complete-btn').addEventListener('click', () => completeSuggestion(s));
     }
+    head.querySelector('.summary-btn').addEventListener('click', () => openSummaryModal(s));
     head.querySelector('.feedback-btn').addEventListener('click', () => openFeedbackModal(s));
     head.querySelector('.delete-btn').addEventListener('click', () => deleteSuggestion(s));
 
@@ -658,6 +688,40 @@ async function rejectImage(s, img) {
     }
 }
 
+async function downloadAllImages(s, btn) {
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Zipping…';
+    let url = null;
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(s.id)}/images.zip`);
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || `HTTP ${res.status}`);
+        }
+        const skipped = res.headers.get('X-Skipped-Images');
+        url = URL.createObjectURL(await res.blob());
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${s.id}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        if (skipped) {
+            toast(`Downloaded — ${skipped.split(',').length} image file(s) missing and skipped`, 'error');
+        } else {
+            toast(`Downloaded ${s.images.length} images`, 'success');
+        }
+    } catch (e) {
+        if (e.message !== 'Unauthorized') toast(`Download failed: ${e.message}`, 'error');
+    } finally {
+        // Revoked late so the browser has finished reading the blob.
+        if (url) setTimeout(() => URL.revokeObjectURL(url), 10000);
+        btn.disabled = false;
+        btn.textContent = label;
+    }
+}
+
 // ---------------- Edit modal ----------------
 
 let editingId = null;
@@ -714,6 +778,53 @@ editSaveBtn.addEventListener('click', async () => {
     }
 });
 
+// ---------------- Summary modal ----------------
+
+// Editable in any status: the summary only describes what the suggestion asked
+// for, so changing it doesn't alter the request itself.
+let summaryId = null;
+
+function openSummaryModal(s) {
+    summaryId = s.id;
+    summaryIdEl.textContent = s.id;
+    summaryInput.value = s.summary || '';
+    summaryError.textContent = '';
+    summaryModal.classList.remove('hidden');
+    setTimeout(() => summaryInput.focus(), 50);
+}
+
+function closeSummaryModal() {
+    summaryModal.classList.add('hidden');
+    summaryId = null;
+}
+
+summaryCloseBtn.addEventListener('click', closeSummaryModal);
+summaryCancelBtn.addEventListener('click', closeSummaryModal);
+summaryModal.querySelector('.modal-backdrop').addEventListener('click', closeSummaryModal);
+
+summarySaveBtn.addEventListener('click', async () => {
+    if (summaryId === null) return;
+    summarySaveBtn.disabled = true;
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/suggestions/${encodeURIComponent(summaryId)}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ summary: summaryInput.value.trim() }),
+        });
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.detail || `HTTP ${res.status}`);
+        }
+        toast('Summary saved', 'success');
+        closeSummaryModal();
+        refresh();
+    } catch (e) {
+        if (e.message !== 'Unauthorized') summaryError.textContent = e.message;
+    } finally {
+        summarySaveBtn.disabled = false;
+    }
+});
+
 // ---------------- Feedback modal ----------------
 
 let feedbackId = null;
@@ -762,6 +873,7 @@ feedbackSaveBtn.addEventListener('click', async () => {
 document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
     if (!editModal.classList.contains('hidden')) closeEditModal();
+    else if (!summaryModal.classList.contains('hidden')) closeSummaryModal();
     else if (!feedbackModal.classList.contains('hidden')) closeFeedbackModal();
     else if (!imageModal.classList.contains('hidden')) closeImageModal();
 });

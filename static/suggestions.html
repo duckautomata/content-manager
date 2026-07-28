@@ -117,6 +117,29 @@
         </div>
     </div>
 
+    <!-- Summary Modal -->
+    <div id="summary-modal" class="modal hidden">
+        <div class="modal-backdrop"></div>
+        <div class="modal-content glass-panel">
+            <button class="close-modal-btn" id="summary-close-btn">&times;</button>
+            <div class="modal-body">
+                <div class="modal-details">
+                    <h3>Summary</h3>
+                    <p class="modal-meta" id="summary-id"></p>
+                    <textarea id="summary-input" class="json-editor summary-editor" spellcheck="true"
+                        maxlength="300"
+                        placeholder="Short summary of what this suggestion is for, shown to the suggester in their status list."></textarea>
+                    <p class="modal-hint">Max 300 characters. Leave empty to fall back to the auto-generated summary.</p>
+                    <p id="summary-error" class="login-error"></p>
+                    <div class="modal-actions">
+                        <button id="summary-cancel-btn" class="btn secondary-btn">Cancel</button>
+                        <button id="summary-save-btn" class="btn primary-btn">Save</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Confirm Modal -->
     <div id="confirm-modal" class="modal hidden">
         <div class="modal-backdrop"></div>
