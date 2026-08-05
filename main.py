@@ -1,5 +1,7 @@
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import logging
 import mimetypes
@@ -12,9 +14,11 @@ import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 import httpx
+from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +85,29 @@ def _load_csv_sources() -> dict:
 
 # Prefix -> list of Google Sheet CSV sources for the "Update from spreadsheet" button.
 CSV_SOURCES = _load_csv_sources()
+# Unattended re-sync of every CSV_SOURCES entry, every N days at CSV_AUTO_SYNC_HOUR
+# in CSV_AUTO_SYNC_TZ. 0 (the default) leaves syncing manual-only.
+CSV_AUTO_SYNC_DAYS = int(os.environ.get("CSV_AUTO_SYNC_DAYS", "0"))
+CSV_AUTO_SYNC_HOUR = 12
+CSV_AUTO_SYNC_TZ_NAME = "America/New_York"
+# A scheduled sync refuses to overwrite a live file whose replacement dropped
+# below this fraction of its rows or bytes — a half-exported or accidentally
+# cleared sheet should never land on top of good data.
+CSV_AUTO_SYNC_MIN_RATIO = float(os.environ.get("CSV_AUTO_SYNC_MIN_RATIO", "0.5"))
+# How often the scheduler re-checks the clock while waiting for the next slot.
+CSV_AUTO_SYNC_TICK_SECONDS = 300
+CSV_AUTO_SYNC_STATE_KEY = "csv_auto_sync_last_run"
+
+try:
+    CSV_AUTO_SYNC_TZ: ZoneInfo | None = ZoneInfo(CSV_AUTO_SYNC_TZ_NAME)
+except ZoneInfoNotFoundError:
+    # No tz database in the image. Guessing UTC would fire at the wrong hour, so
+    # stay off instead.
+    CSV_AUTO_SYNC_TZ = None
+    logger.warning(
+        "Time zone %s unavailable (install the tzdata package); CSV auto-sync disabled",
+        CSV_AUTO_SYNC_TZ_NAME,
+    )
 TURNSTILE_ENABLED = os.environ.get("TURNSTILE_ENABLED", "true").strip().lower() in ("true", "1", "yes", "on")
 TURNSTILE_SECRET_KEY = os.environ.get("TURNSTILE_SECRET_KEY")
 TURNSTILE_SITE_KEY = os.environ.get("TURNSTILE_SITE_KEY", "")
@@ -101,11 +128,10 @@ SUGGESTIONS_PAGE_LIMIT = 200
 DB_PATH = os.environ.get("DB_PATH", "data/suggestions.db")
 SUGGESTIONS_PREFIX = "_suggestions/"
 PENDING_PREFIX = "_suggestions/_pending/"
-# Delayed-delete markers. Key encodes the due time so the sweep can filter by a
-# lexical compare without reading each object: {prefix}{YYYYMMDDTHHMMSSZ}__{id}.json
+# Delayed-delete jobs live in the scheduled_deletes table. This prefix is only
+# still read to drain markers left by the older R2-backed layout.
 SCHEDULED_DELETE_PREFIX = "_scheduled_deletes/"
 SCHEDULED_DELETE_POLL_SECONDS = int(os.environ.get("SCHEDULED_DELETE_POLL_SECONDS", "60"))
-_DUE_FMT = "%Y%m%dT%H%M%SZ"
 MAX_DELETE_DELAY_SECONDS = 366 * 24 * 3600  # ~1 year ceiling
 MIN_DELETE_DELAY_SECONDS = 60
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
@@ -152,6 +178,13 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("R2 suggestion migration failed")
 
+        try:
+            migrated = await asyncio.to_thread(_migrate_r2_scheduled_deletes_sync)
+            if migrated:
+                logger.info("Migrated %d scheduled delete(s) from R2 into the local database", migrated)
+        except Exception:
+            logger.exception("R2 scheduled-delete migration failed")
+
     rollup_task: asyncio.Task | None = None
     if IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS > 0 and DISCORD_WEBHOOK:
         rollup_task = asyncio.create_task(_upload_rollup_loop())
@@ -165,9 +198,28 @@ async def lifespan(app: FastAPI):
         sweep_task = asyncio.create_task(_scheduled_delete_loop())
         logger.info("Scheduled-delete sweep enabled, poll=%ds", SCHEDULED_DELETE_POLL_SECONDS)
 
+    csv_sync_task: asyncio.Task | None = None
+    if S3_CONFIGURED and CSV_AUTO_SYNC_DAYS > 0 and CSV_SOURCES and CSV_AUTO_SYNC_TZ is not None:
+        csv_sync_task = asyncio.create_task(_csv_auto_sync_loop())
+        logger.info(
+            "CSV auto-sync enabled, every %d day(s) at %02d:00 %s, %d prefix(es)",
+            CSV_AUTO_SYNC_DAYS,
+            CSV_AUTO_SYNC_HOUR,
+            CSV_AUTO_SYNC_TZ_NAME,
+            len(CSV_SOURCES),
+        )
+    elif CSV_AUTO_SYNC_DAYS > 0 and not CSV_SOURCES:
+        logger.warning("CSV_AUTO_SYNC_DAYS is set but CSV_SOURCES is empty; auto-sync disabled")
+
     try:
         yield
     finally:
+        if csv_sync_task is not None:
+            csv_sync_task.cancel()
+            try:
+                await csv_sync_task
+            except asyncio.CancelledError:
+                pass
         if sweep_task is not None:
             sweep_task.cancel()
             try:
@@ -377,6 +429,37 @@ def _init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_suggestions_site_status"
                 " ON suggestions (site, status, submitted_at)"
             )
+            # Small key/value scratchpad for background jobs that must remember
+            # something across restarts (currently the CSV auto-sync anchor).
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            # Pending "delete these keys later" jobs. due_at is a fixed-width
+            # UTC ISO stamp, so the sweep can select due rows with a plain
+            # string compare.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduled_deletes (
+                    id TEXT PRIMARY KEY,
+                    prefix TEXT NOT NULL DEFAULT '',
+                    label TEXT NOT NULL DEFAULT '',
+                    target_keys TEXT NOT NULL DEFAULT '[]',
+                    due_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduled_deletes_due ON scheduled_deletes (due_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scheduled_deletes_prefix ON scheduled_deletes (prefix, due_at)"
+            )
             # Added after the table shipped; older databases need the column.
             columns = {r["name"] for r in conn.execute("PRAGMA table_info(suggestions)")}
             if "summary" not in columns:
@@ -388,6 +471,34 @@ def _init_db() -> None:
 
 
 _init_db()
+
+
+def _iso_z(dt: datetime) -> str:
+    """UTC ISO stamp with no sub-second part, so stored timestamps are all the
+    same width and sort/compare correctly as plain strings."""
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _get_app_state(key: str) -> str | None:
+    conn = _db_connect()
+    try:
+        row = conn.execute("SELECT value FROM app_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+def _set_app_state(key: str, value: str) -> None:
+    conn = _db_connect()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO app_state (key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+    finally:
+        conn.close()
 
 
 # Payload keys, in priority order, that tend to name the thing a suggestion is
@@ -952,6 +1063,240 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
         raise HTTPException(status_code=500, detail=f"Unexpected server error during upload: {e}")
 
 
+async def _download_csv_export(client: httpx.AsyncClient, entry: dict) -> tuple[bytes | None, str | None]:
+    """Fetch one sheet tab's CSV export. Returns (body, error); exactly one is set."""
+    url = f"https://docs.google.com/spreadsheets/d/{entry['id']}/export?format=csv&gid={entry['gid']}"
+    try:
+        resp = await client.get(url)
+    except Exception as ex:
+        return None, str(ex)
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}"
+    # A private sheet redirects to an HTML login page instead of CSV.
+    if "text/html" in resp.headers.get("content-type", "").lower():
+        return None, "Got HTML, not CSV — is the sheet link-accessible?"
+    if not resp.content:
+        return None, "Empty response"
+    return resp.content, None
+
+
+def _read_csv_rows(body: bytes) -> list[list[str]]:
+    """Parse CSV bytes into rows, dropping blank ones. Raises on bad input."""
+    text = body.decode("utf-8-sig")
+    return [row for row in csv.reader(io.StringIO(text, newline="")) if any(c.strip() for c in row)]
+
+
+def _fetch_live_csv(storage_key: str) -> tuple[bytes | None, str | None]:
+    """Read the CSV currently in the bucket. Returns (body, error). A missing
+    object is (None, None) — the first sync has nothing to compare against — but
+    a transient read failure is an error, so we never mistake "can't read it" for
+    "it isn't there" and skip the safety checks."""
+    try:
+        obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=storage_key)
+        return obj["Body"].read(), None
+    except ClientError as ex:
+        code = ex.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None, None
+        return None, f"could not read live file: {code or ex}"
+    except Exception as ex:
+        return None, f"could not read live file: {ex}"
+
+
+def _validate_csv_replacement(body: bytes, live: bytes | None) -> str | None:
+    """Sanity-check a freshly downloaded CSV against the file it would replace.
+    Returns a reason to reject, or None when the replacement looks trustworthy."""
+    try:
+        rows = _read_csv_rows(body)
+    except UnicodeDecodeError:
+        return "not valid UTF-8"
+    except csv.Error as ex:
+        return f"unparseable CSV: {ex}"
+    if not rows:
+        return "CSV has no rows"
+    header = [c.strip() for c in rows[0]]
+    if not any(header):
+        return "CSV header row is empty"
+
+    if live is None:
+        return None
+    try:
+        live_rows = _read_csv_rows(live)
+    except (UnicodeDecodeError, csv.Error):
+        # The live file isn't readable as CSV, so it's not a baseline worth
+        # trusting. The structural checks above still applied.
+        return None
+    if not live_rows:
+        return None
+
+    live_header = [c.strip() for c in live_rows[0]]
+    if header != live_header:
+        return f"header changed: {_short_list(live_header)} -> {_short_list(header)}"
+    if len(rows) < len(live_rows) * CSV_AUTO_SYNC_MIN_RATIO:
+        return f"row count fell from {len(live_rows)} to {len(rows)}"
+    if len(body) < len(live) * CSV_AUTO_SYNC_MIN_RATIO:
+        return f"size fell from {len(live)} to {len(body)} bytes"
+    return None
+
+
+def _short_list(values: list[str], limit: int = 120) -> str:
+    text = ", ".join(values)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+async def _sync_prefix_checked(key: str, entries: list[dict]) -> tuple[list[str], list[dict]]:
+    """Download and validate every CSV configured for `key` before writing any of
+    them. Returns (uploaded, errors); if validation turns up a problem the errors
+    are returned with nothing uploaded, leaving the live files untouched."""
+    staged: list[tuple[str, bytes, str]] = []
+    errors: list[dict] = []
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        for e in entries:
+            body, err = await _download_csv_export(client, e)
+            if err:
+                errors.append({"file": e["file"], "error": err})
+                continue
+            storage_key = f"{key}{e['file']}"
+            live, read_err = await asyncio.to_thread(_fetch_live_csv, storage_key)
+            if read_err:
+                errors.append({"file": e["file"], "error": read_err})
+                continue
+            if problem := _validate_csv_replacement(body, live):
+                errors.append({"file": e["file"], "error": problem})
+                continue
+            staged.append((storage_key, body, e["file"]))
+
+    if errors:
+        return [], errors
+
+    uploaded: list[str] = []
+    for storage_key, body, name in staged:
+        try:
+            await asyncio.to_thread(
+                s3.put_object,
+                Bucket=R2_BUCKET_NAME,
+                Key=storage_key,
+                Body=body,
+                ContentType="text/csv",
+            )
+            uploaded.append(name)
+        except Exception as ex:
+            errors.append({"file": name, "error": f"upload failed: {ex}"})
+    return uploaded, errors
+
+
+async def _notify_csv_sync_failure(key: str, errors: list[dict], uploaded: list[str]) -> None:
+    detail = "\n".join(f"`{x['file']}` — {x['error']}" for x in errors[:10])
+    if len(errors) > 10:
+        detail += f"\n... and {len(errors) - 10} more"
+    if len(detail) > 1000:
+        detail = detail[:1000] + "\n... (truncated)"
+    logger.error("Scheduled CSV sync failed for %s: %s", key, detail.replace("\n", "; "))
+
+    if not DISCORD_WEBHOOK:
+        return
+    if uploaded:
+        description = (
+            f"`{key}` was only partly written — the downloads passed their checks but "
+            f"{len(uploaded)} file(s) uploaded before this failure. Verify the prefix."
+        )
+    else:
+        description = f"Nothing was written under `{key}`. The live files are unchanged."
+
+    embed: dict = {
+        "title": "Scheduled CSV sync aborted",
+        "color": 0xED4245,
+        "description": description,
+        "fields": [{"name": "Problems", "value": detail}],
+    }
+    if uploaded:
+        embed["fields"].append({"name": "Already uploaded", "value": ", ".join(f"`{u}`" for u in uploaded[:10])})
+    if ADMIN_URL:
+        embed["url"] = ADMIN_URL.rstrip("/") + "/"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+    except Exception:
+        logger.exception("Discord CSV sync alert delivery failed")
+
+
+async def _run_csv_auto_sync() -> None:
+    """One scheduled pass over every configured prefix. Each prefix is handled
+    independently, so a bad sheet in one doesn't hold up the others."""
+    for key, entries in CSV_SOURCES.items():
+        try:
+            uploaded, errors = await _sync_prefix_checked(key, entries)
+        except Exception as ex:
+            logger.exception("CSV auto-sync crashed for %s", key)
+            uploaded, errors = [], [{"file": "*", "error": f"unexpected error: {ex}"}]
+        if errors:
+            await _notify_csv_sync_failure(key, errors, uploaded)
+        else:
+            logger.info("CSV auto-sync updated %s: %s", key, ", ".join(uploaded) or "(nothing configured)")
+
+
+def _next_csv_sync_slot(after: datetime) -> datetime:
+    """The first CSV_AUTO_SYNC_HOUR local-time occurrence strictly after `after`."""
+    local = after.astimezone(CSV_AUTO_SYNC_TZ)
+    slot = local.replace(hour=CSV_AUTO_SYNC_HOUR, minute=0, second=0, microsecond=0)
+    if slot <= local:
+        slot += timedelta(days=1)
+    return slot
+
+
+def _csv_sync_due_after(last_run: datetime) -> datetime:
+    """The slot CSV_AUTO_SYNC_DAYS after `last_run`, snapped to the target hour."""
+    local = last_run.astimezone(CSV_AUTO_SYNC_TZ)
+    return (local + timedelta(days=CSV_AUTO_SYNC_DAYS)).replace(
+        hour=CSV_AUTO_SYNC_HOUR, minute=0, second=0, microsecond=0
+    )
+
+
+async def _csv_auto_sync_loop() -> None:
+    now = datetime.now(timezone.utc)
+    raw = await asyncio.to_thread(_get_app_state, CSV_AUTO_SYNC_STATE_KEY)
+    last_run: datetime | None = None
+    if raw:
+        try:
+            last_run = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if last_run.tzinfo is None:
+                last_run = last_run.replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.warning("Ignoring unparseable CSV auto-sync anchor %r", raw)
+
+    due = _csv_sync_due_after(last_run) if last_run else _next_csv_sync_slot(now)
+    if due <= now:
+        # First boot, or the container was down through the slot. Wait for the
+        # next one rather than syncing at some arbitrary hour.
+        due = _next_csv_sync_slot(now)
+    logger.info("CSV auto-sync: next run at %s", due.isoformat())
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            if now >= due:
+                await _run_csv_auto_sync()
+                ran_at = datetime.now(timezone.utc)
+                await asyncio.to_thread(
+                    _set_app_state, CSV_AUTO_SYNC_STATE_KEY, ran_at.isoformat().replace("+00:00", "Z")
+                )
+                due = _csv_sync_due_after(ran_at)
+                if due <= ran_at:
+                    due = _next_csv_sync_slot(ran_at)
+                logger.info("CSV auto-sync: next run at %s", due.isoformat())
+                continue
+            # Tick rather than sleeping for days, so a suspended host or a clock
+            # adjustment still lands on the slot instead of drifting past it.
+            await asyncio.sleep(min(CSV_AUTO_SYNC_TICK_SECONDS, (due - now).total_seconds()))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("CSV auto-sync loop iteration failed")
+            await asyncio.sleep(CSV_AUTO_SYNC_TICK_SECONDS)
+
+
 @app.post("/api/content/sync-csv", dependencies=[Depends(require_api_key)])
 async def sync_csv(prefix: str):
     """Re-download the CSV exports configured for `prefix` from Google Sheets and
@@ -969,22 +1314,9 @@ async def sync_csv(prefix: str):
     errors: list = []
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
         for e in entries:
-            url = f"https://docs.google.com/spreadsheets/d/{e['id']}/export?format=csv&gid={e['gid']}"
-            try:
-                resp = await client.get(url)
-                if resp.status_code != 200:
-                    errors.append({"file": e["file"], "error": f"HTTP {resp.status_code}"})
-                    continue
-                # A private sheet redirects to an HTML login page instead of CSV.
-                if "text/html" in resp.headers.get("content-type", "").lower():
-                    errors.append({"file": e["file"], "error": "Got HTML, not CSV — is the sheet link-accessible?"})
-                    continue
-                body = resp.content
-                if not body:
-                    errors.append({"file": e["file"], "error": "Empty response"})
-                    continue
-            except Exception as ex:
-                errors.append({"file": e["file"], "error": str(ex)})
+            body, err = await _download_csv_export(client, e)
+            if err:
+                errors.append({"file": e["file"], "error": err})
                 continue
             try:
                 await asyncio.to_thread(
@@ -1041,61 +1373,82 @@ async def bulk_delete_content(req: BulkDeleteRequest):
 # ---------------- Scheduled (delayed) deletion ----------------
 
 
+def _scheduled_delete_row_to_record(row: sqlite3.Row) -> dict:
+    try:
+        keys = json.loads(row["target_keys"])
+    except (TypeError, ValueError):
+        keys = []
+    return {
+        "id": row["id"],
+        "prefix": row["prefix"],
+        "label": row["label"],
+        "keys": keys if isinstance(keys, list) else [],
+        "due_at": row["due_at"],
+        "created_at": row["created_at"],
+    }
+
+
+def _insert_scheduled_delete_sync(record: dict) -> None:
+    conn = _db_connect()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO scheduled_deletes (id, prefix, label, target_keys, due_at, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    record["id"],
+                    record["prefix"],
+                    record["label"],
+                    json.dumps(record["keys"]),
+                    record["due_at"],
+                    record["created_at"],
+                ),
+            )
+    finally:
+        conn.close()
+
+
 def _list_scheduled_deletes_sync(prefix: str | None = None) -> list:
-    """Return all pending scheduled-delete records, newest due first. When
+    """Return all pending scheduled-delete records, soonest due first. When
     `prefix` is given, only records whose target prefix matches are returned."""
-    records: list = []
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith(".json"):
-                continue
-            try:
-                body = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)["Body"].read()
-                rec = json.loads(body)
-            except Exception:
-                continue
-            if prefix and rec.get("prefix") != prefix:
-                continue
-            rec["storage_key"] = key
-            records.append(rec)
-    records.sort(key=lambda r: r.get("due_at", ""))
-    return records
+    conn = _db_connect()
+    try:
+        if prefix:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_deletes WHERE prefix = ? ORDER BY due_at", (prefix,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM scheduled_deletes ORDER BY due_at").fetchall()
+        return [_scheduled_delete_row_to_record(r) for r in rows]
+    finally:
+        conn.close()
 
 
-def _find_scheduled_delete_key(sid: str) -> str | None:
-    """Locate a marker object by its id (embedded in the key), without reading bodies."""
-    suffix = f"__{sid}.json"
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
-        for obj in page.get("Contents", []):
-            if obj["Key"].endswith(suffix):
-                return obj["Key"]
-    return None
+def _cancel_scheduled_delete_sync(sid: str) -> bool:
+    """Drop a pending job by id. False means there was no such job."""
+    conn = _db_connect()
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM scheduled_deletes WHERE id = ?", (sid,))
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
 def _run_due_deletions_sync() -> int:
-    """Delete the target objects of every marker whose due time has passed, then
-    remove the marker. Returns the number of markers executed."""
-    now_compact = datetime.now(timezone.utc).strftime(_DUE_FMT)
+    """Delete the target objects of every job whose due time has passed, then drop
+    the job row. Returns the number of jobs executed."""
+    now = _iso_z(datetime.now(timezone.utc))
     executed = 0
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            name = key[len(SCHEDULED_DELETE_PREFIX):]
-            due_compact = name.split("__", 1)[0]
-            # Fixed-width sortable stamp -> lexical compare is chronological.
-            if due_compact > now_compact:
-                continue
-            try:
-                body = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)["Body"].read()
-                rec = json.loads(body)
-            except Exception:
-                logger.exception("Skipping unreadable scheduled-delete marker %s", key)
-                continue
-            target_keys = [k for k in rec.get("keys", []) if k]
+    conn = _db_connect()
+    try:
+        # Fixed-width UTC stamps -> lexical compare is chronological.
+        rows = conn.execute(
+            "SELECT * FROM scheduled_deletes WHERE due_at <= ? ORDER BY due_at", (now,)
+        ).fetchall()
+        for row in rows:
+            rec = _scheduled_delete_row_to_record(row)
+            target_keys = [k for k in rec["keys"] if k]
             if target_keys:
                 try:
                     s3.delete_objects(
@@ -1103,12 +1456,61 @@ def _run_due_deletions_sync() -> int:
                         Delete={"Objects": [{"Key": k} for k in target_keys], "Quiet": True},
                     )
                 except Exception:
-                    logger.exception("Failed deleting targets for scheduled delete %s", rec.get("id"))
+                    # Leave the row in place so the next sweep retries it.
+                    logger.exception("Failed deleting targets for scheduled delete %s", rec["id"])
                     continue
-            s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+            with conn:
+                conn.execute("DELETE FROM scheduled_deletes WHERE id = ?", (rec["id"],))
             executed += 1
-            logger.info("Executed scheduled deletion %s (%d object(s))", rec.get("id"), len(target_keys))
+            logger.info("Executed scheduled deletion %s (%d object(s))", rec["id"], len(target_keys))
+    finally:
+        conn.close()
     return executed
+
+
+def _migrate_r2_scheduled_deletes_sync() -> int:
+    """Import legacy scheduled-delete markers from R2 into the database, removing
+    each R2 copy after a successful import. Idempotent: an id already present is
+    left untouched, but its stale marker object is still cleaned up."""
+    paginator = s3.get_paginator("list_objects_v2")
+    migrated = 0
+    conn = _db_connect()
+    try:
+        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=SCHEDULED_DELETE_PREFIX):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".json"):
+                    continue
+                try:
+                    body = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)["Body"].read()
+                    rec = json.loads(body)
+                    sid = rec.get("id")
+                    due_at = rec.get("due_at")
+                    if not sid or not due_at:
+                        logger.warning("Skipping malformed scheduled-delete marker %s", key)
+                        continue
+                    with conn:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO scheduled_deletes"
+                            " (id, prefix, label, target_keys, due_at, created_at)"
+                            " VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                sid,
+                                rec.get("prefix", "") or "",
+                                rec.get("label", "") or "",
+                                json.dumps([k for k in rec.get("keys", []) if k]),
+                                due_at,
+                                rec.get("created_at")
+                                or obj["LastModified"].isoformat().replace("+00:00", "Z"),
+                            ),
+                        )
+                    s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                    migrated += 1
+                except Exception:
+                    logger.exception("Failed to migrate scheduled delete %s", key)
+    finally:
+        conn.close()
+    return migrated
 
 
 async def _scheduled_delete_loop() -> None:
@@ -1145,36 +1547,24 @@ async def schedule_delete(req: ScheduleDeleteRequest):
         "prefix": req.prefix or "",
         "label": req.label or "",
         "keys": keys,
-        "due_at": due.isoformat().replace("+00:00", "Z"),
-        "created_at": now.isoformat().replace("+00:00", "Z"),
+        "due_at": _iso_z(due),
+        "created_at": _iso_z(now),
     }
-    storage_key = f"{SCHEDULED_DELETE_PREFIX}{due.strftime(_DUE_FMT)}__{sid}.json"
-    await asyncio.to_thread(
-        s3.put_object,
-        Bucket=R2_BUCKET_NAME,
-        Key=storage_key,
-        Body=json.dumps(record).encode("utf-8"),
-        ContentType="application/json",
-    )
+    await asyncio.to_thread(_insert_scheduled_delete_sync, record)
     return {"status": "scheduled", "id": sid, "due_at": record["due_at"]}
 
 
 @app.get("/api/scheduled-deletes", dependencies=[Depends(require_api_key)])
 async def list_scheduled_deletes(prefix: str | None = None):
-    if not S3_CONFIGURED:
-        raise HTTPException(status_code=500, detail="S3 client not configured")
     records = await asyncio.to_thread(_list_scheduled_deletes_sync, prefix)
     return {"scheduled": records}
 
 
 @app.delete("/api/scheduled-deletes/{sid}", dependencies=[Depends(require_api_key)])
 async def cancel_scheduled_delete(sid: str):
-    if not S3_CONFIGURED:
-        raise HTTPException(status_code=500, detail="S3 client not configured")
-    key = await asyncio.to_thread(_find_scheduled_delete_key, sid)
-    if not key:
+    cancelled = await asyncio.to_thread(_cancel_scheduled_delete_sync, sid)
+    if not cancelled:
         raise HTTPException(status_code=404, detail="Scheduled deletion not found")
-    await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=key)
     return {"status": "cancelled", "id": sid}
 
 

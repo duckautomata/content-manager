@@ -6,8 +6,9 @@ services:
     env_file:
       - .env
     volumes:
-      # Local suggestion database (SQLite). Keep this mounted or suggestions
-      # are lost when the container is recreated.
+      # Local application database (SQLite): suggestions, pending scheduled
+      # deletions, and background-job state. Keep this mounted or they are lost
+      # when the container is recreated.
       - ./data:/app/data
     networks:
       - content-network

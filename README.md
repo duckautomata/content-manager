@@ -100,9 +100,9 @@ You can view the image on Dockerhub:
 The easiest way to run the docker image is to
 1. copy [docker-compose.yml](./docker-compose.yml) and create an `.env` file in a folder where you want to run it.
 2. Ensure your `.env` file is properly configured.
-   The compose file mounts `./data` into the container for the suggestion
+   The compose file mounts `./data` into the container for the application
    database (SQLite) — back this folder up and keep the mount, or suggestions
-   are lost when the container is recreated.
+   and pending scheduled deletions are lost when the container is recreated.
 3. Start the containers:
    ```bash
    docker compose up -d
@@ -212,6 +212,71 @@ and then removed from the bucket.
 ### R2 lifecycle rule
 
 Set a 30-day delete rule on the prefix `_suggestions/_pending/`. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days. Suggestion records themselves are in the local database, not R2, so they are unaffected and kept forever as an audit trail.
+
+### Delayed deletion
+
+Deleting media from the manager can be deferred ("delete in 30 days") so a CDN
+cache has time to expire before the files actually go away. Each pending job —
+its id, target keys, due time, and the label shown in the UI — is a row in the
+`scheduled_deletes` table of the database. A background sweep runs every
+`SCHEDULED_DELETE_POLL_SECONDS` (default 60), deletes the R2 objects of every job
+whose due time has passed, and drops the row. If the R2 delete fails the row is
+kept, so the next sweep retries rather than silently losing the job.
+
+Because the jobs are database rows, R2 holds nothing but the media files and the
+CSVs. Keep `./data` mounted or pending deletions are lost on container recreation.
+
+On startup, any leftover markers from the older R2-backed layout
+(`_scheduled_deletes/{due}__{id}.json`) are imported into the table and removed
+from the bucket, so no pending deletion is dropped by upgrading. The import is
+idempotent and can be re-run safely; a marker that can't be parsed is left in the
+bucket and logged rather than discarded.
+
+### Spreadsheet (CSV) sources
+
+`CSV_SOURCES` maps a bucket prefix to the Google Sheet tabs whose CSV export should
+overwrite files under it. Each referenced tab must be link-accessible ("anyone with
+the link"); `gid` is the tab id from the sheet URL (`.../edit#gid=<gid>`).
+
+```
+CSV_SOURCES={"dokinomicon":[{"file":"data.csv","id":"<sheet-id>","gid":"0"}]}
+```
+
+That powers the manager's **Update from spreadsheet** button, which downloads each
+configured tab and overwrites the matching file.
+
+#### Automatic sync
+
+Set `CSV_AUTO_SYNC_DAYS` to a positive number and the server re-syncs every
+configured prefix on its own, every N days at **12:00 America/New_York** (noon ET,
+following daylight saving). `0` — the default — leaves syncing manual-only.
+
+The scheduled path is deliberately more cautious than the button, because nobody is
+watching it. For each prefix it downloads **every** file and checks all of them
+before writing **any** of them; if a single check fails, that prefix is left
+completely untouched and the failure goes to `DISCORD_WEBHOOK`. A rejected sync is
+not retried early — it waits for the next slot — so a broken sheet can't spam the
+webhook. Other prefixes are unaffected by one prefix failing.
+
+A download is rejected when it:
+
+- fails to fetch (non-200, network error, empty body, or an HTML login page — the
+  usual sign a sheet stopped being link-accessible),
+- isn't valid UTF-8 or doesn't parse as CSV, or has no rows / an empty header,
+- has a **different header row** than the file it would replace (a column added,
+  removed, or renamed upstream),
+- **shrank** below `CSV_AUTO_SYNC_MIN_RATIO` (default `0.5`) of the live file's row
+  count or byte size — the signature of a half-exported or cleared sheet.
+
+The last two only apply when there's a live file to compare against, so the first
+sync of a new file always goes through. If the live file can't be read at all, the
+sync is refused rather than overwriting it blind. Lower `CSV_AUTO_SYNC_MIN_RATIO` if
+one of your sheets legitimately shrinks a lot in a single edit.
+
+The "last run" timestamp lives in the `app_state` table of the suggestions database,
+so the interval survives container restarts — keep `./data` mounted. On first start
+(or if the container was down through a slot) the next run is the upcoming noon ET,
+not immediately on boot.
 
 ### Cloudflare Turnstile setup
 
