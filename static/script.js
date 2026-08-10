@@ -36,6 +36,12 @@ const othersCount = document.getElementById('others-count');
 const dataFilesSection = document.getElementById('data-files-section');
 const dataFilesList = document.getElementById('data-files-list');
 const dataFilesCount = document.getElementById('data-files-count');
+const imagesSection = document.getElementById('images-section');
+const videosSection = document.getElementById('videos-section');
+const othersSection = document.getElementById('others-section');
+const contentEmpty = document.getElementById('content-empty');
+const prefixBreadcrumb = document.getElementById('prefix-breadcrumb');
+const suggestionsBadge = document.getElementById('suggestions-badge');
 
 const filterInput = document.getElementById('filter-input');
 const replaceFileInput = document.getElementById('replace-file-input');
@@ -73,6 +79,7 @@ const modalOrigLink = document.getElementById('modal-original-link');
 const modalPrevLink = document.getElementById('modal-preview-link');
 const modalDelBtn = document.getElementById('modal-delete-btn');
 const modalCopyIdBtn = document.getElementById('modal-copy-id-btn');
+const modalCopyUrlBtn = document.getElementById('modal-copy-url-btn');
 const modalCancelScheduleBtn = document.getElementById('modal-cancel-schedule-btn');
 const closeBtn = document.querySelector('.close-modal-btn');
 const backdrop = document.querySelector('.modal-backdrop');
@@ -372,6 +379,29 @@ filterInput.addEventListener('input', () => {
     }, 200);
 });
 
+// "/" focuses the filter from anywhere; Escape inside it clears and blurs.
+document.addEventListener('keydown', (e) => {
+    if (e.key !== '/' || e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    const typing = t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement
+        || t instanceof HTMLSelectElement || (t && t.isContentEditable);
+    if (typing) return;
+    // Every overlay (preview, results, confirm, login) is a .modal that toggles
+    // "hidden" — never steal focus from an open one.
+    if (document.querySelector('.modal:not(.hidden)')) return;
+    e.preventDefault();
+    filterInput.focus();
+});
+
+filterInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        filterInput.value = '';
+        state.filter = '';
+        renderContent();
+        filterInput.blur();
+    }
+});
+
 // Event Listeners
 refreshBtn.addEventListener('click', () => {
     state.prefix = prefixInput.value;
@@ -490,12 +520,80 @@ function getPublicUrl(key) {
     return `${BASE_PATH}api/content?key=${encodeURIComponent(key)}`; // Mock fallback
 }
 
+// Pending-suggestions badge on the header's Suggestions link. Best-effort:
+// failures just leave the badge hidden.
+async function loadSuggestionsBadge() {
+    if (!suggestionsBadge) return;
+    try {
+        const res = await apiFetch(`${BASE_PATH}api/suggestions/counts`);
+        if (!res.ok) return;
+        const counts = await res.json();
+        const pending = Object.values(counts).reduce((sum, c) => sum + (c.pending || 0), 0);
+        suggestionsBadge.textContent = pending;
+        suggestionsBadge.classList.toggle('hidden', pending === 0);
+    } catch (_) { /* non-fatal */ }
+}
+
+// Clickable path segments for the current prefix, shown when it nests.
+function renderBreadcrumb() {
+    if (!prefixBreadcrumb) return;
+    const segments = state.prefix.split('/').filter(Boolean);
+    if (segments.length < 2) {
+        prefixBreadcrumb.classList.add('hidden');
+        prefixBreadcrumb.innerHTML = '';
+        return;
+    }
+    prefixBreadcrumb.innerHTML = '';
+    segments.forEach((seg, idx) => {
+        if (idx > 0) {
+            const sep = document.createElement('span');
+            sep.className = 'crumb-sep';
+            sep.textContent = '/';
+            prefixBreadcrumb.appendChild(sep);
+        }
+        const target = segments.slice(0, idx + 1).join('/') + '/';
+        if (idx === segments.length - 1) {
+            const here = document.createElement('span');
+            here.className = 'crumb current';
+            here.textContent = seg;
+            prefixBreadcrumb.appendChild(here);
+        } else {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'crumb';
+            btn.textContent = seg;
+            btn.title = `Go to ${target}`;
+            btn.addEventListener('click', () => goToPrefix(target));
+            prefixBreadcrumb.appendChild(btn);
+        }
+    });
+    prefixBreadcrumb.classList.remove('hidden');
+}
+
+function renderGridSkeletons(container, n) {
+    for (let i = 0; i < n; i++) {
+        const sk = document.createElement('div');
+        sk.className = 'skeleton-tile';
+        container.appendChild(sk);
+    }
+}
+
 // Fetch State
 async function fetchContent() {
     refreshBtn.classList.add('spinner', 'loading');
     imagesGrid.innerHTML = '';
     videosGrid.innerHTML = '';
     othersList.innerHTML = '';
+    contentEmpty.classList.add('hidden');
+    // Show the images section as the loading canvas (a previous render may have
+    // hidden it); tuck the rest away until we know what this prefix holds.
+    imagesSection.classList.remove('hidden');
+    videosSection.classList.add('hidden');
+    othersSection.classList.add('hidden');
+    renderGridSkeletons(imagesGrid, 6);
+    // Depends only on state.prefix, so render before the fetch — a failed load
+    // must not leave the previous prefix's crumbs on screen.
+    renderBreadcrumb();
 
     try {
         const res = await apiFetch(`${BASE_PATH}api/content?prefix=${encodeURIComponent(state.prefix)}`);
@@ -511,7 +609,17 @@ async function fetchContent() {
         renderSyncButton(data.csv_sources || []);
         await loadScheduledDeletes();
         renderContent();
+        loadSuggestionsBadge();
     } catch (err) {
+        // Leave a coherent page behind: clear stale state, then show an error
+        // message where the content would have been.
+        state.images = [];
+        state.videos = [];
+        state.others = [];
+        renderSyncButton([]);
+        renderContent();
+        contentEmpty.textContent = `Could not load ${state.prefix}. Check the console and refresh.`;
+        contentEmpty.classList.remove('hidden');
         console.error(err);
         toast('Error fetching content. Check console for details.', 'error');
     } finally {
@@ -646,6 +754,23 @@ function renderContent() {
     othersCount.textContent = others.length;
     dataFilesCount.textContent = dataFiles.length;
 
+    // Hide sections with nothing to show; when everything is empty, say so once
+    // instead of stacking empty headings.
+    imagesSection.classList.toggle('hidden', imgs.length === 0);
+    videosSection.classList.toggle('hidden', vids.length === 0);
+    othersSection.classList.toggle('hidden', others.length === 0);
+    // Data files: visible whenever CSV sources are configured (the sync button
+    // lives here, and it must stay reachable even before the first sync), but
+    // hidden when a filter matches none of them.
+    if (dataFilesSection) {
+        dataFilesSection.classList.toggle('hidden', _csvSources.length === 0 || (!!f && dataFiles.length === 0));
+    }
+    const nothing = !imgs.length && !vids.length && !others.length && !dataFiles.length;
+    contentEmpty.textContent = f
+        ? `Nothing in ${state.prefix} matches “${filterInput.value.trim()}”.`
+        : `Nothing under ${state.prefix} yet. Drop files above to upload.`;
+    contentEmpty.classList.toggle('hidden', !nothing);
+
     renderIncrementally(dataFilesList, dataFiles, createOtherItem);
     renderIncrementally(imagesGrid, imgs, (it) => createMediaCard(it, '🖼️'));
     renderIncrementally(videosGrid, vids, (it) => createMediaCard(it, '🎥'));
@@ -700,7 +825,15 @@ function openModal(img) {
         toast(ok ? `Copied ${img.slug}` : 'Copy failed', ok ? 'success' : 'error');
     };
 
-    modalOrigLink.href = getPublicUrl(state.prefix + origKey);
+    // Captured now: state.prefix can change while the modal is open (popstate),
+    // and this URL must keep matching the item on display.
+    const origUrl = getPublicUrl(state.prefix + origKey);
+    modalCopyUrlBtn.onclick = async () => {
+        const ok = await copyToClipboard(origUrl);
+        toast(ok ? 'Copied public URL' : 'Copy failed', ok ? 'success' : 'error');
+    };
+
+    modalOrigLink.href = origUrl;
     modalOrigLink.style.display = img.files.original ? 'inline-flex' : 'none';
 
     modalPrevLink.href = getPublicUrl(state.prefix + img.files.preview);

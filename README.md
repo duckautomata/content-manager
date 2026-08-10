@@ -209,6 +209,24 @@ On startup, any suggestion JSON objects still in R2 (legacy `_suggestions/{id}.j
 or `_suggestions/{site}/{status}/...json` layouts) are imported into the database
 and then removed from the bucket.
 
+### Performance & benchmark logging
+
+Approving a suggestion copies every pending image's three files (original,
+preview, thumbnail) to the live prefix **concurrently** and then removes the
+pending originals with a single batch delete, so approval time stays roughly
+flat as the image count grows. The same applies to uploads (preview/thumbnail
+conversion and the three R2 puts run in parallel) and to the per-image pending
+checks at submission time. `R2_OP_CONCURRENCY` (default `16`) caps how many R2
+object operations a single request runs at once.
+
+Slow paths log a one-line `[bench]` breakdown of where the time went:
+
+```
+INFO:content-manager:[bench] approve sug_x site=dokimotes images=4 total=812ms read_db=2ms copy=655ms delete_pending=118ms write_db=3ms
+INFO:content-manager:[bench] convert+store a1b2c3.png bytes=52341 total=1204ms slug=35ms convert=890ms upload=270ms
+INFO:content-manager:[bench] submit sug_y site=dokimotes images=2 total=310ms lookup_images=280ms write_db=4ms
+```
+
 ### R2 lifecycle rule
 
 Set a 30-day delete rule on the prefix `_suggestions/_pending/`. In the Cloudflare dashboard: **R2 → bucket → Settings → Object lifecycle rules → Add rule**, scope to prefix `_suggestions/_pending/`, action: delete after 30 days. Suggestion records themselves are in the local database, not R2, so they are unaffected and kept forever as an audit trail.

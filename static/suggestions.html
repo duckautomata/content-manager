@@ -24,16 +24,6 @@
                 <h1>Suggestions</h1>
                 <div class="header-controls">
                     <a href="index.html" class="btn secondary-btn">← Manager</a>
-                    <div class="search-box">
-                        <label for="status-filter" class="visually-hidden">Status</label>
-                        <select id="status-filter">
-                            <option value="pending" selected>Pending</option>
-                            <option value="approved">Approved</option>
-                            <option value="completed">Completed</option>
-                            <option value="rejected">Rejected</option>
-                            <option value="">All</option>
-                        </select>
-                    </div>
                     <button id="refresh-btn" class="btn primary-btn" title="Refresh">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                             stroke-linecap="round" stroke-linejoin="round">
@@ -44,7 +34,8 @@
                     </button>
                 </div>
             </div>
-            <div id="site-tabs" class="site-tabs"></div>
+            <div id="site-tabs" class="site-tabs" role="tablist" aria-label="Sites"></div>
+            <div id="status-tabs" class="status-tabs" role="tablist" aria-label="Status filter"></div>
         </header>
 
         <main>

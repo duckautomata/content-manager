@@ -5,9 +5,20 @@ const BASE_PATH = (() => {
 
 const params = new URLSearchParams(window.location.search);
 
+// '' means "All". The URL serializes it as status=all; unknown values coerce
+// to pending so a typoed link doesn't render an unfiltered-looking dead page.
+const VALID_STATUS_FILTERS = ['pending', 'approved', 'completed', 'rejected', ''];
+
+function statusFromUrl() {
+    const s = params.get('status');
+    if (s === null) return 'pending';
+    if (s === 'all') return '';
+    return VALID_STATUS_FILTERS.includes(s) ? s : 'pending';
+}
+
 const state = {
     site: params.get('site') || null,
-    status: params.get('status') ?? 'pending',
+    status: statusFromUrl(),
     focusId: params.get('id') || null,
     counts: {},
     suggestions: [],
@@ -20,7 +31,7 @@ const state = {
 // DOM
 const siteTabs = document.getElementById('site-tabs');
 const refreshBtn = document.getElementById('refresh-btn');
-const statusFilter = document.getElementById('status-filter');
+const statusTabs = document.getElementById('status-tabs');
 const suggestionsList = document.getElementById('suggestions-list');
 const emptyState = document.getElementById('empty-state');
 
@@ -181,7 +192,9 @@ function confirmAction({ title = 'Confirm', message = '', confirmText = 'Confirm
 function updateUrl() {
     const url = new URL(window.location);
     if (state.site) url.searchParams.set('site', state.site); else url.searchParams.delete('site');
-    if (state.status) url.searchParams.set('status', state.status); else url.searchParams.delete('status');
+    // Always serialize the status ('all' for '') so the All filter survives a
+    // reload / share instead of silently reverting to Pending.
+    url.searchParams.set('status', state.status || 'all');
     if (state.focusId) url.searchParams.set('id', state.focusId); else url.searchParams.delete('id');
     window.history.replaceState({}, '', url);
 }
@@ -228,25 +241,92 @@ async function loadSuggestions() {
     state.truncated = !!data.truncated;
 }
 
+// Monotonic token so an older, slower refresh can never render on top of a
+// newer one (rapid pill/tab clicks fire overlapping fetches).
+let refreshSeq = 0;
+
 async function refresh() {
+    const seq = ++refreshSeq;
     refreshBtn.classList.add('spinner', 'loading');
+    if (!suggestionsList.children.length) {
+        renderSkeletons();
+    } else {
+        suggestionsList.classList.add('loading-dim');
+    }
     try {
         await loadCounts();
         await loadSuggestions();
+        if (seq !== refreshSeq) return;
         renderTabs();
+        renderStatusTabs();
         renderSuggestions();
         updateUrl();
     } catch (e) {
+        if (seq !== refreshSeq) return;
         if (e.message !== 'Unauthorized') {
             console.error(e);
             toast('Failed to load suggestions', 'error');
         }
+        suggestionsList.querySelectorAll('.skeleton-card').forEach(el => el.remove());
+        if (!suggestionsList.children.length) {
+            emptyState.textContent = 'Could not load suggestions. Try refreshing.';
+            emptyState.classList.remove('hidden');
+        }
     } finally {
-        refreshBtn.classList.remove('spinner', 'loading');
+        if (seq === refreshSeq) {
+            suggestionsList.classList.remove('loading-dim');
+            refreshBtn.classList.remove('spinner', 'loading');
+        }
     }
 }
 
 // ---------------- Render ----------------
+
+const STATUSES = [
+    ['pending', 'Pending'],
+    ['approved', 'Approved'],
+    ['completed', 'Completed'],
+    ['rejected', 'Rejected'],
+    ['', 'All'],
+];
+
+const EMPTY_COUNTS = { pending: 0, approved: 0, rejected: 0, completed: 0 };
+
+function siteCounts(site) {
+    return state.counts[site] || EMPTY_COUNTS;
+}
+
+function totalCount(counts) {
+    return counts.pending + counts.approved + counts.completed + counts.rejected;
+}
+
+// Count shown on a site tab: matches the active status filter ("All" = total).
+function filteredCount(counts) {
+    return state.status ? (counts[state.status] || 0) : totalCount(counts);
+}
+
+function countsTooltip(counts) {
+    return `${counts.pending} pending · ${counts.approved} approved · ${counts.completed} completed · ${counts.rejected} rejected`;
+}
+
+function renderSkeletons(n = 3) {
+    emptyState.classList.add('hidden');
+    suggestionsList.innerHTML = '';
+    for (let i = 0; i < n; i++) {
+        const sk = document.createElement('div');
+        sk.className = 'skeleton-card glass-panel';
+        sk.innerHTML = `
+            <div class="skeleton-row">
+                <span class="skeleton-line" style="width: 120px;"></span>
+                <span class="skeleton-line" style="width: 90px;"></span>
+                <span class="skeleton-line" style="width: 70px;"></span>
+            </div>
+            <span class="skeleton-line" style="width: 60%;"></span>
+            <span class="skeleton-line skeleton-block"></span>
+        `;
+        suggestionsList.appendChild(sk);
+    }
+}
 
 function renderTabs() {
     siteTabs.innerHTML = '';
@@ -256,18 +336,57 @@ function renderTabs() {
         return;
     }
     for (const site of sites) {
-        const counts = state.counts[site] || { pending: 0, approved: 0, rejected: 0, completed: 0 };
+        const counts = siteCounts(site);
+        const shown = filteredCount(counts);
+        // The badge shows the count for the active filter, so only accent it
+        // when that count IS the pending count; sites with pending work get a
+        // separate dot under other filters.
+        const accent = state.status === 'pending' && shown > 0;
+        const pendingDot = state.status !== 'pending' && counts.pending > 0;
         const tab = document.createElement('button');
         tab.className = `site-tab${site === state.site ? ' active' : ''}`;
-        tab.innerHTML = `<span>${site}</span><span class="tab-badge${counts.pending ? ' has-pending' : ''}">${counts.pending}</span>`;
+        tab.setAttribute('role', 'tab');
+        tab.setAttribute('aria-selected', site === state.site ? 'true' : 'false');
+        tab.title = countsTooltip(counts);
+        tab.innerHTML = `<span>${escapeHtml(site)}</span><span class="tab-badge${accent ? ' has-pending' : ''}">${shown}</span>${pendingDot ? '<span class="pending-dot" title="Has pending suggestions"></span>' : ''}`;
         tab.addEventListener('click', () => {
             if (state.site !== site) {
                 state.site = site;
                 state.focusId = null;
+                renderTabs();
+                renderStatusTabs();
                 refresh();
             }
         });
         siteTabs.appendChild(tab);
+    }
+}
+
+// Status pills for the current site, each showing how many suggestions are in
+// that state ("All" shows the site total).
+function renderStatusTabs() {
+    statusTabs.innerHTML = '';
+    if (!state.site) return;
+    const counts = siteCounts(state.site);
+    for (const [value, label] of STATUSES) {
+        const n = value ? (counts[value] || 0) : totalCount(counts);
+        const tab = document.createElement('button');
+        tab.className = `status-tab status-tab-${value || 'all'}${value === state.status ? ' active' : ''}`;
+        tab.setAttribute('role', 'tab');
+        tab.setAttribute('aria-selected', value === state.status ? 'true' : 'false');
+        tab.innerHTML = `<span>${label}</span><span class="tab-badge">${n}</span>`;
+        tab.addEventListener('click', () => {
+            if (state.status !== value) {
+                state.status = value;
+                state.focusId = null;
+                // Re-render both bars from in-memory counts right away so the
+                // highlight follows the click even if the fetch then fails.
+                renderTabs();
+                renderStatusTabs();
+                refresh();
+            }
+        });
+        statusTabs.appendChild(tab);
     }
 }
 
@@ -293,6 +412,10 @@ function imageOriginalUrl(suggestion, img) {
 function renderSuggestions() {
     suggestionsList.innerHTML = '';
     if (!state.suggestions.length) {
+        const statusLabel = (STATUSES.find(([v]) => v === state.status) || ['', ''])[1].toLowerCase();
+        emptyState.textContent = state.status
+            ? `No ${statusLabel} suggestions for ${state.site || 'this site'}.`
+            : `No suggestions for ${state.site || 'this site'} yet.`;
         emptyState.classList.remove('hidden');
         return;
     }
@@ -325,6 +448,22 @@ const KIND_LABEL = {
     delete: 'delete existing entry',
 };
 
+// Compact "how long ago", e.g. "just now", "5m ago", "3h ago", "2d ago".
+// Falls back to the date itself once it's over a month old.
+function timeAgo(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    const mins = Math.floor((Date.now() - d) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days < 31) return `${days}d ago`;
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
 function renderCard(s) {
     const card = document.createElement('section');
     card.className = `suggestion-card glass-panel status-${s.status}`;
@@ -339,13 +478,13 @@ function renderCard(s) {
     head.className = 'suggestion-head';
     head.innerHTML = `
         <div class="suggestion-meta">
-            <span class="suggestion-id">${s.id}</span>
+            <button type="button" class="suggestion-id" title="Click to copy id">${s.id}</button>
             <span class="suggestion-kind kind-${s.kind}" title="What this suggestion is requesting">
                 <span class="kind-prefix">Suggests</span>
                 <span class="kind-value">${kindLabel}</span>
             </span>
             <span class="suggestion-status status-pill status-${s.status}">${s.status}</span>
-            <span class="suggestion-date">${submitted}</span>
+            <span class="suggestion-date" title="${escapeHtml(submitted)}">${timeAgo(s.submitted_at)}</span>
         </div>
         <div class="suggestion-actions">
             ${isPending ? `
@@ -387,10 +526,21 @@ function renderCard(s) {
     const payloadBlock = document.createElement('div');
     payloadBlock.className = 'payload-block';
     const payloadText = JSON.stringify(s.payload || {}, null, 2);
+    const payloadLines = payloadText.split('\n').length;
+    const collapsible = payloadLines > 14;
     payloadBlock.innerHTML = `
         <div class="block-label">Payload</div>
-        <pre class="payload-json">${escapeHtml(payloadText)}</pre>
+        <pre class="payload-json${collapsible ? ' collapsed' : ''}">${escapeHtml(payloadText)}</pre>
+        ${collapsible ? `<button type="button" class="payload-toggle">Show all ${payloadLines} lines</button>` : ''}
     `;
+    if (collapsible) {
+        const pre = payloadBlock.querySelector('.payload-json');
+        const toggle = payloadBlock.querySelector('.payload-toggle');
+        toggle.addEventListener('click', () => {
+            const nowCollapsed = pre.classList.toggle('collapsed');
+            toggle.textContent = nowCollapsed ? `Show all ${payloadLines} lines` : 'Collapse';
+        });
+    }
     body.appendChild(payloadBlock);
 
     if (s.images && s.images.length) {
@@ -419,6 +569,10 @@ function renderCard(s) {
     card.appendChild(body);
 
     // Wire up action buttons
+    head.querySelector('.suggestion-id').addEventListener('click', async () => {
+        const ok = await copyToClipboard(s.id);
+        toast(ok ? `Copied ${s.id}` : 'Copy failed', ok ? 'success' : 'error');
+    });
     if (isPending) {
         head.querySelector('.approve-btn').addEventListener('click', () => approveSuggestion(s));
         head.querySelector('.reject-btn').addEventListener('click', () => rejectSuggestion(s));
@@ -879,12 +1033,6 @@ document.addEventListener('keydown', (e) => {
 });
 
 // ---------------- Filters ----------------
-
-statusFilter.value = state.status;
-statusFilter.addEventListener('change', () => {
-    state.status = statusFilter.value;
-    refresh();
-});
 
 refreshBtn.addEventListener('click', () => refresh());
 

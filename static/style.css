@@ -391,6 +391,14 @@ main {
     gap: 2rem;
 }
 
+/* Each header + grid pair keeps the same 2rem rhythm the flat layout had. */
+.content-group,
+#data-files-section {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+
 .section-header {
     display: flex;
     align-items: center;
@@ -841,6 +849,16 @@ main {
     color: white;
 }
 
+/* Pending-work marker on site tabs when the badge is showing another filter's
+   count, so "this site still needs review" stays visible at a glance. */
+.pending-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--accent-2);
+    flex-shrink: 0;
+}
+
 .suggestions-list {
     display: flex;
     flex-direction: column;
@@ -905,6 +923,13 @@ main {
     border: 1px solid var(--glass-border);
     padding: 0.2rem 0.5rem;
     border-radius: 6px;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.suggestion-id:hover {
+    background: var(--glass-hover);
+    border-color: rgba(255, 255, 255, 0.2);
 }
 
 .suggestion-kind {
@@ -1155,4 +1180,272 @@ main {
 
 .json-editor:focus {
     border-color: var(--primary);
+}
+
+/* Status filter pills (suggestions page) */
+.status-tabs {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin: 0.75rem auto 0;
+    max-width: 1200px;
+}
+
+.status-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    color: var(--text-muted);
+    padding: 0.35rem 0.85rem;
+    border-radius: 999px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.status-tab:hover {
+    background: var(--glass-hover);
+    color: var(--text-main);
+}
+
+.status-tab.active {
+    color: var(--text-main);
+    background: var(--glass-hover);
+}
+
+.status-tab-pending.active {
+    border-color: rgba(236, 72, 153, 0.6);
+    background: rgba(236, 72, 153, 0.15);
+    color: #f9a8d4;
+}
+
+.status-tab-approved.active {
+    border-color: rgba(34, 197, 94, 0.6);
+    background: rgba(34, 197, 94, 0.15);
+    color: #86efac;
+}
+
+.status-tab-completed.active {
+    border-color: rgba(59, 130, 246, 0.6);
+    background: rgba(59, 130, 246, 0.15);
+    color: #93c5fd;
+}
+
+.status-tab-rejected.active {
+    border-color: rgba(220, 38, 38, 0.6);
+    background: rgba(220, 38, 38, 0.15);
+    color: #fca5a5;
+}
+
+.status-tab-all.active {
+    border-color: var(--primary);
+    background: rgba(109, 40, 217, 0.2);
+    color: #c4b5fd;
+}
+
+/* Suggestions badge on the manager's header link */
+#suggestions-badge {
+    margin-left: 0.4rem;
+}
+
+/* Collapsible payloads */
+.payload-json.collapsed {
+    max-height: 180px;
+    overflow-y: hidden;
+    /* The mask would fade a classic horizontal scrollbar into an invisible
+       strip; scroll after expanding instead. */
+    overflow-x: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+    mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+}
+
+/* "Show all N lines" must actually show all of them: lift the base rule's
+   300px cap once expanded (non-collapsible payloads are ≤14 lines anyway). */
+.payload-block .payload-json:not(.collapsed) {
+    max-height: none;
+}
+
+.payload-toggle {
+    align-self: flex-start;
+    margin-top: 0.4rem;
+    background: none;
+    border: none;
+    color: var(--accent-1);
+    font-family: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0.2rem 0;
+}
+
+.payload-toggle:hover {
+    text-decoration: underline;
+}
+
+.payload-block {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+}
+
+/* Prefix breadcrumb (manager page) */
+.prefix-breadcrumb {
+    max-width: 1200px;
+    margin: 0.75rem auto 0;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+}
+
+.crumb {
+    background: none;
+    border: none;
+    padding: 0.15rem 0.35rem;
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+    transition: background 0.2s ease, color 0.2s ease;
+}
+
+.crumb:hover {
+    background: var(--glass-hover);
+    color: var(--text-main);
+}
+
+.crumb.current {
+    color: var(--text-main);
+    font-weight: 600;
+    cursor: default;
+}
+
+.crumb-sep {
+    color: var(--text-muted);
+    opacity: 0.5;
+}
+
+/* Loading skeletons */
+@keyframes shimmer {
+    0% {
+        background-position: -400px 0;
+    }
+
+    100% {
+        background-position: 400px 0;
+    }
+}
+
+.skeleton-line,
+.skeleton-tile {
+    background: linear-gradient(90deg, var(--glass-bg) 25%, var(--glass-hover) 50%, var(--glass-bg) 75%);
+    background-size: 800px 100%;
+    animation: shimmer 1.4s linear infinite;
+    border-radius: 6px;
+}
+
+.skeleton-card {
+    padding: 1.25rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.skeleton-row {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.skeleton-line {
+    display: inline-block;
+    height: 0.9rem;
+}
+
+.skeleton-block {
+    height: 6rem;
+    width: 100%;
+}
+
+.skeleton-tile {
+    aspect-ratio: 1;
+    border-radius: 12px;
+    border: 1px solid var(--glass-border);
+}
+
+.loading-dim {
+    opacity: 0.55;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+}
+
+/* Accessibility + small screens */
+.btn:focus-visible,
+.site-tab:focus-visible,
+.status-tab:focus-visible,
+.crumb:focus-visible,
+.suggestion-id:focus-visible {
+    outline: 2px solid var(--accent-1);
+    outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+    .blob,
+    .skeleton-line,
+    .skeleton-tile {
+        animation: none;
+    }
+
+    * {
+        transition-duration: 0.01ms !important;
+    }
+}
+
+@media (max-width: 640px) {
+    .app-container {
+        padding: 1rem;
+    }
+
+    .glass-header {
+        margin: -1rem -1rem 0;
+        padding: 1rem;
+    }
+
+    .images-grid,
+    .videos-grid {
+        grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+        gap: 1rem;
+    }
+
+    .suggestion-images-grid {
+        grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+    }
+
+    .search-box input {
+        width: 130px;
+    }
+
+    .prefix-selector input {
+        width: 100px;
+    }
+
+    .modal {
+        padding: 0.75rem;
+    }
+
+    .modal-details {
+        padding: 1rem;
+    }
+
+    .suggestion-head,
+    .suggestion-actions {
+        gap: 0.5rem;
+    }
 }

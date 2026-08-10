@@ -10,8 +10,9 @@ import re
 import secrets
 import sqlite3
 import tempfile
+import time
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -115,6 +116,16 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 ADMIN_URL = os.environ.get("ADMIN_URL", "")
 IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS = int(os.environ.get("IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS", "600"))
 
+# Concurrent R2 object operations (copies/uploads/deletes) issued per request.
+# R2 handles parallel object ops well; this only keeps a single request from
+# opening an unbounded number of connections.
+R2_OP_CONCURRENCY = int(os.environ.get("R2_OP_CONCURRENCY", "16"))
+if R2_OP_CONCURRENCY < 1:
+    # Semaphore(0) would block every upload/approval forever.
+    logging.getLogger("content-manager").warning(
+        "R2_OP_CONCURRENCY=%d is invalid; using 1", R2_OP_CONCURRENCY
+    )
+    R2_OP_CONCURRENCY = 1
 MAX_PUBLIC_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_PUBLIC_PAYLOAD_BYTES = 10 * 1024 * 1024
 MAX_SUGGESTION_IMAGE_IDS = 1000
@@ -297,20 +308,81 @@ def _list_all_objects(prefix: str):
     return contents
 
 
+def _delete_objects_chunked_sync(keys: list[str]) -> None:
+    """Batch-delete keys, 1000 per request (the S3 API ceiling). DeleteObjects
+    reports per-key failures inside a 200 response, so those are collected and
+    raised; every chunk is attempted first so one bad key can't strand the
+    rest."""
+    errors: list[dict] = []
+    for i in range(0, len(keys), 1000):
+        resp = s3.delete_objects(
+            Bucket=R2_BUCKET_NAME,
+            Delete={"Objects": [{"Key": k} for k in keys[i : i + 1000]], "Quiet": True},
+        )
+        if isinstance(resp, dict):
+            errors.extend(resp.get("Errors") or [])
+    if errors:
+        summary = ", ".join(
+            f"{e.get('Key')} ({e.get('Code', '?')}: {e.get('Message', '?')})"
+            for e in errors[:10]
+        )
+        if len(errors) > 10:
+            summary += f", and {len(errors) - 10} more"
+        raise RuntimeError(f"delete_objects failed for {len(errors)} key(s): {summary}")
+
+
+# ---------------- Benchmarks ----------------
+
+class _Benchmark:
+    """Accumulates named stage durations for one operation, then emits a single
+    log line showing where the time went, e.g.
+
+        [bench] approve sug_x site=dokimotes images=4 total=812ms read_db=2ms copy=655ms delete_pending=118ms write_db=3ms
+    """
+
+    def __init__(self, label: str):
+        self.label = label
+        self.stages: list[tuple[str, float]] = []
+        self._start = time.perf_counter()
+
+    @contextmanager
+    def stage(self, name: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.stages.append((name, time.perf_counter() - t0))
+
+    def log(self, detail: str = "") -> None:
+        total_ms = (time.perf_counter() - self._start) * 1000
+        stages = " ".join(f"{name}={secs * 1000:.0f}ms" for name, secs in self.stages)
+        logger.info(
+            "[bench] %s%s total=%.0fms%s",
+            self.label,
+            f" {detail}" if detail else "",
+            total_ms,
+            f" {stages}" if stages else "",
+        )
+
+
 # ---------------- Image conversion + storage ----------------
 
 async def _convert_and_store(
     *, content: bytes, mime: str, original_ext: str, original_name: str, prefix: str
 ) -> dict:
     """Run the conversion pipeline and upload original/preview/thumbnail under `prefix`.
-    Rolls back partial uploads on failure. Returns slug, ext, and the three keys."""
+    Preview and thumbnail are converted concurrently, and the three uploads run
+    concurrently. Rolls back partial uploads on failure. Returns slug, ext, and
+    the three keys."""
+    bench = _Benchmark("convert+store")
     async with httpx.AsyncClient() as client:
         try:
-            slug_resp = await client.get(
-                f"{CONVERSION_SERVICE_URL}/slug", params={"name": original_name}
-            )
-            slug_resp.raise_for_status()
-            short_uuid = slug_resp.json()["short_uuid"]
+            with bench.stage("slug"):
+                slug_resp = await client.get(
+                    f"{CONVERSION_SERVICE_URL}/slug", params={"name": original_name}
+                )
+                slug_resp.raise_for_status()
+                short_uuid = slug_resp.json()["short_uuid"]
         except Exception as e:
             logger.exception("Failed to get slug from conversion service")
             raise HTTPException(status_code=500, detail=f"Failed to get slug: {e}")
@@ -319,30 +391,35 @@ async def _convert_and_store(
         preview_key = f"{prefix}{short_uuid}_p.webp"
         thumbnail_key = f"{prefix}{short_uuid}_t.webp"
 
-        try:
-            preview_resp = await client.post(
-                f"{CONVERSION_SERVICE_URL}/convert",
-                content=content,
-                headers={"Content-Type": mime},
+        with bench.stage("convert"):
+            preview_resp, thumb_resp = await asyncio.gather(
+                client.post(
+                    f"{CONVERSION_SERVICE_URL}/convert",
+                    content=content,
+                    headers={"Content-Type": mime},
+                ),
+                client.post(
+                    f"{CONVERSION_SERVICE_URL}/thumbnail",
+                    params={"height": 128},
+                    content=content,
+                    headers={"Content-Type": mime},
+                ),
+                return_exceptions=True,
             )
-            preview_resp.raise_for_status()
-            preview_content = preview_resp.content
-        except Exception as e:
-            logger.exception("Failed to convert image to preview")
-            raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
 
-        try:
-            thumb_resp = await client.post(
-                f"{CONVERSION_SERVICE_URL}/thumbnail",
-                params={"height": 128},
-                content=content,
-                headers={"Content-Type": mime},
-            )
-            thumb_resp.raise_for_status()
-            thumb_content = thumb_resp.content
-        except Exception as e:
-            logger.exception("Failed to create thumbnail")
-            raise HTTPException(status_code=500, detail=f"Thumbnail conversion failed: {e}")
+        def _conversion_content(resp, what: str) -> bytes:
+            if isinstance(resp, BaseException):
+                logger.error("%s failed: %s", what, resp)
+                raise HTTPException(status_code=500, detail=f"{what}: {resp}")
+            try:
+                resp.raise_for_status()
+            except Exception as e:
+                logger.exception("%s returned an error", what)
+                raise HTTPException(status_code=500, detail=f"{what}: {e}")
+            return resp.content
+
+        preview_content = _conversion_content(preview_resp, "Conversion failed")
+        thumb_content = _conversion_content(thumb_resp, "Thumbnail conversion failed")
 
     uploads = [
         (original_key, content, mime),
@@ -350,21 +427,30 @@ async def _convert_and_store(
         (thumbnail_key, thumb_content, "image/webp"),
     ]
     uploaded: list[str] = []
-    try:
-        for key, body, ctype in uploads:
+    sem = asyncio.Semaphore(R2_OP_CONCURRENCY)
+
+    async def _put(key: str, body: bytes, ctype: str) -> None:
+        async with sem:
             await asyncio.to_thread(
                 s3.put_object, Bucket=R2_BUCKET_NAME, Key=key, Body=body, ContentType=ctype,
             )
-            uploaded.append(key)
-    except Exception as e:
-        logger.exception("Upload failed mid-flight, rolling back")
-        for k in uploaded:
-            try:
-                await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=k)
-            except Exception:
-                logger.exception("Rollback failed for key %s", k)
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+        uploaded.append(key)
 
+    with bench.stage("upload"):
+        results = await asyncio.gather(
+            *(_put(key, body, ctype) for key, body, ctype in uploads),
+            return_exceptions=True,
+        )
+    errors = [r for r in results if isinstance(r, BaseException)]
+    if errors:
+        logger.error("Upload failed (%s), rolling back %d object(s)", errors[0], len(uploaded))
+        try:
+            await asyncio.to_thread(_delete_objects_chunked_sync, uploaded)
+        except Exception:
+            logger.exception("Rollback failed for keys %s", uploaded)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {errors[0]}")
+
+    bench.log(f"{short_uuid}{original_ext} bytes={len(content)}")
     return {
         "slug": short_uuid,
         "ext": original_ext,
@@ -375,6 +461,27 @@ async def _convert_and_store(
 
 
 # ---------------- Suggestion helpers ----------------
+
+# Serializes mutations of a single suggestion. Without this, two concurrent
+# approvals (double-click, two admin tabs) both read status=pending and both
+# copy images; the loser's rollback then deletes the very objects the winner
+# just published. Entries are reference-counted so the dict doesn't grow with
+# every suggestion ever touched.
+_suggestion_locks: dict[str, list] = {}
+
+
+@asynccontextmanager
+async def _suggestion_lock(suggestion_id: str):
+    entry = _suggestion_locks.setdefault(suggestion_id, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0:
+            _suggestion_locks.pop(suggestion_id, None)
+
 
 _ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
@@ -1650,13 +1757,26 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
     if req.site not in ALLOWED_SITES:
         raise HTTPException(status_code=400, detail=f"Unknown site: {req.site}")
 
-    images = []
+    bench = _Benchmark("submit")
     for img_id in req.image_ids:
         _validate_id(img_id, "image")
-        ext = await asyncio.to_thread(_find_pending_image_ext_sync, img_id)
-        if not ext:
-            raise HTTPException(status_code=400, detail=f"Image not found in pending: {img_id}")
-        images.append({"id": img_id, "ext": ext, "status": "pending", "moved_to": None})
+    sem = asyncio.Semaphore(R2_OP_CONCURRENCY)
+
+    async def _lookup_ext(img_id: str) -> str | None:
+        async with sem:
+            return await asyncio.to_thread(_find_pending_image_ext_sync, img_id)
+
+    with bench.stage("lookup_images"):
+        exts = await asyncio.gather(*(_lookup_ext(i) for i in req.image_ids))
+    missing = [i for i, ext in zip(req.image_ids, exts) if not ext]
+    if missing:
+        raise HTTPException(
+            status_code=400, detail=f"Image not found in pending: {', '.join(missing)}"
+        )
+    images = [
+        {"id": img_id, "ext": ext, "status": "pending", "moved_to": None}
+        for img_id, ext in zip(req.image_ids, exts)
+    ]
 
     sid = "sug_" + secrets.token_urlsafe(8)
     suggestion = {
@@ -1670,7 +1790,9 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
         "summary": req.summary.strip() or _derive_summary(req.kind, req.payload),
         "submitted_at": _utc_now_iso(),
     }
-    await _write_suggestion(suggestion)
+    with bench.stage("write_db"):
+        await _write_suggestion(suggestion)
+    bench.log(f"{sid} site={req.site} images={len(images)}")
 
     sample_url = None
     if images and PUBLIC_URL_PREFIX:
@@ -1790,100 +1912,131 @@ async def download_suggestion_images(suggestion_id: str):
 @app.patch("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
 async def edit_suggestion(suggestion_id: str, req: SuggestionEditRequest):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Suggestion not found")
+    async with _suggestion_lock(suggestion_id):
+        s = await _read_suggestion(suggestion_id)
+        if not s:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
 
-    content_edit = any(v is not None for v in (req.payload, req.kind, req.site))
-    if content_edit and s.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="Only pending suggestions can be edited")
+        content_edit = any(v is not None for v in (req.payload, req.kind, req.site))
+        if content_edit and s.get("status") != "pending":
+            raise HTTPException(status_code=400, detail="Only pending suggestions can be edited")
 
-    if req.payload is not None:
-        s["payload"] = req.payload
-    if req.kind is not None:
-        s["kind"] = req.kind
-    if req.site is not None:
-        if req.site not in ALLOWED_SITES:
-            raise HTTPException(status_code=400, detail=f"Unknown site: {req.site}")
-        s["site"] = req.site
-    # Admin feedback and the summary are editable at any time, including
-    # after finalization — neither changes what the suggestion asks for.
-    if req.admin_context is not None:
-        s["admin_context"] = req.admin_context
-    if req.summary is not None:
-        # Clearing it re-derives from the (possibly just-updated) kind/payload,
-        # so the stored summary is never empty.
-        s["summary"] = req.summary.strip() or _derive_summary(s["kind"], s["payload"])
+        if req.payload is not None:
+            s["payload"] = req.payload
+        if req.kind is not None:
+            s["kind"] = req.kind
+        if req.site is not None:
+            if req.site not in ALLOWED_SITES:
+                raise HTTPException(status_code=400, detail=f"Unknown site: {req.site}")
+            s["site"] = req.site
+        # Admin feedback and the summary are editable at any time, including
+        # after finalization — neither changes what the suggestion asks for.
+        if req.admin_context is not None:
+            s["admin_context"] = req.admin_context
+        if req.summary is not None:
+            # Clearing it re-derives from the (possibly just-updated) kind/payload,
+            # so the stored summary is never empty.
+            s["summary"] = req.summary.strip() or _derive_summary(s["kind"], s["payload"])
 
-    await _write_suggestion(s)
+        await _write_suggestion(s)
     return s
 
 
-async def _approve_suggestion(s: dict) -> dict:
-    """Copy all pending images to the live prefix, then delete originals.
-    Rolls back copies if any step fails."""
+async def _approve_suggestion(s: dict, bench: _Benchmark) -> dict:
+    """Copy all pending images to the live prefix — every copy runs concurrently
+    (bounded by R2_OP_CONCURRENCY) — then batch-delete the pending originals in
+    a single request. If any copy fails, the copies that landed are rolled back."""
     site = s["site"]
-    completed: list[tuple[str, str]] = []
-    try:
-        for img in s.get("images", []):
-            if img.get("status") != "pending":
-                continue
-            img_id = img["id"]
-            ext = img["ext"]
-            triples = [
-                (f"{PENDING_PREFIX}{img_id}{ext}", f"{site}/{img_id}{ext}"),
-                (f"{PENDING_PREFIX}{img_id}_p.webp", f"{site}/{img_id}_p.webp"),
-                (f"{PENDING_PREFIX}{img_id}_t.webp", f"{site}/{img_id}_t.webp"),
-            ]
-            for src, dst in triples:
-                await asyncio.to_thread(
-                    s3.copy_object,
-                    CopySource={"Bucket": R2_BUCKET_NAME, "Key": src},
-                    Bucket=R2_BUCKET_NAME,
-                    Key=dst,
-                )
-                completed.append((src, dst))
-            img["status"] = "approved"
-            img["moved_to"] = f"{site}/{img_id}{ext}"
+    pending = [img for img in s.get("images", []) if img.get("status") == "pending"]
+    copies: list[tuple[str, str]] = []
+    for img in pending:
+        img_id = img["id"]
+        ext = img["ext"]
+        copies.extend([
+            (f"{PENDING_PREFIX}{img_id}{ext}", f"{site}/{img_id}{ext}"),
+            (f"{PENDING_PREFIX}{img_id}_p.webp", f"{site}/{img_id}_p.webp"),
+            (f"{PENDING_PREFIX}{img_id}_t.webp", f"{site}/{img_id}_t.webp"),
+        ])
 
-        for src, _ in completed:
-            try:
-                await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=src)
-            except Exception:
-                logger.warning("Failed to delete pending source %s after approval (non-fatal)", src)
+    sem = asyncio.Semaphore(R2_OP_CONCURRENCY)
 
-        s["status"] = "approved"
-        return s
-    except Exception:
-        logger.exception("Approval failed mid-flight; rolling back copies")
-        for _, dst in completed:
-            try:
-                await asyncio.to_thread(s3.delete_object, Bucket=R2_BUCKET_NAME, Key=dst)
-            except Exception:
-                logger.warning("Rollback delete failed for %s", dst)
+    async def _copy(src: str, dst: str) -> None:
+        async with sem:
+            await asyncio.to_thread(
+                s3.copy_object,
+                CopySource={"Bucket": R2_BUCKET_NAME, "Key": src},
+                Bucket=R2_BUCKET_NAME,
+                Key=dst,
+            )
+
+    with bench.stage("copy"):
+        results = await asyncio.gather(
+            *(_copy(src, dst) for src, dst in copies), return_exceptions=True
+        )
+
+    failures = [
+        (pair, r) for pair, r in zip(copies, results) if isinstance(r, BaseException)
+    ]
+    if failures:
+        landed = [
+            dst for (_, dst), r in zip(copies, results) if not isinstance(r, BaseException)
+        ]
+        (src, _), err = failures[0]
+        logger.error(
+            "Approval copy failed for %s (%s); rolling back %d landed cop%s",
+            src, err, len(landed), "y" if len(landed) == 1 else "ies",
+        )
+        try:
+            await asyncio.to_thread(_delete_objects_chunked_sync, landed)
+        except Exception:
+            logger.exception("Rollback delete failed")
         raise HTTPException(status_code=500, detail="Approval failed; rolled back")
+
+    if copies:
+        with bench.stage("delete_pending"):
+            try:
+                await asyncio.to_thread(
+                    _delete_objects_chunked_sync, [src for src, _ in copies]
+                )
+            except Exception:
+                # Non-fatal: the pending prefix's 30-day TTL collects leftovers.
+                logger.exception("Failed to delete pending sources after approval (non-fatal)")
+
+    for img in pending:
+        img["status"] = "approved"
+        img["moved_to"] = f"{site}/{img['id']}{img['ext']}"
+    s["status"] = "approved"
+    return s
+
+
+_STATUS_BENCH_LABELS = {"approved": "approve", "rejected": "reject", "completed": "complete"}
 
 
 @app.patch("/api/suggestions/{suggestion_id}/status", dependencies=[Depends(require_api_key)])
 async def update_suggestion_status(suggestion_id: str, req: SuggestionStatusRequest):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Suggestion not found")
+    bench = _Benchmark(_STATUS_BENCH_LABELS.get(req.status, req.status))
+    async with _suggestion_lock(suggestion_id):
+        with bench.stage("read_db"):
+            s = await _read_suggestion(suggestion_id)
+        if not s:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
 
-    if req.status == "completed":
-        if s.get("status") != "approved":
-            raise HTTPException(status_code=400, detail="Only approved suggestions can be marked completed")
-        s["status"] = "completed"
-    else:
-        if s.get("status") != "pending":
-            raise HTTPException(status_code=400, detail="Suggestion already finalized")
-        if req.status == "approved":
-            s = await _approve_suggestion(s)
+        if req.status == "completed":
+            if s.get("status") != "approved":
+                raise HTTPException(status_code=400, detail="Only approved suggestions can be marked completed")
+            s["status"] = "completed"
         else:
-            s["status"] = "rejected"
+            if s.get("status") != "pending":
+                raise HTTPException(status_code=400, detail="Suggestion already finalized")
+            if req.status == "approved":
+                s = await _approve_suggestion(s, bench)
+            else:
+                s["status"] = "rejected"
 
-    await _write_suggestion(s)
+        with bench.stage("write_db"):
+            await _write_suggestion(s)
+    bench.log(f"{suggestion_id} site={s['site']} images={len(s.get('images', []))}")
     return s
 
 
@@ -1894,66 +2047,60 @@ async def update_suggestion_status(suggestion_id: str, req: SuggestionStatusRequ
 async def reject_image(suggestion_id: str, image_id: str):
     _validate_id(suggestion_id, "suggestion")
     _validate_id(image_id, "image")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Suggestion not found")
-    if s.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="Cannot modify images on finalized suggestion")
+    async with _suggestion_lock(suggestion_id):
+        s = await _read_suggestion(suggestion_id)
+        if not s:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if s.get("status") != "pending":
+            raise HTTPException(status_code=400, detail="Cannot modify images on finalized suggestion")
 
-    img = next((i for i in s.get("images", []) if i.get("id") == image_id), None)
-    if not img:
-        raise HTTPException(status_code=404, detail="Image not in suggestion")
-    if img.get("status") != "pending":
-        raise HTTPException(status_code=400, detail=f"Image already {img.get('status')}")
+        img = next((i for i in s.get("images", []) if i.get("id") == image_id), None)
+        if not img:
+            raise HTTPException(status_code=404, detail="Image not in suggestion")
+        if img.get("status") != "pending":
+            raise HTTPException(status_code=400, detail=f"Image already {img.get('status')}")
 
-    keys = [
-        f"{PENDING_PREFIX}{image_id}{img['ext']}",
-        f"{PENDING_PREFIX}{image_id}_p.webp",
-        f"{PENDING_PREFIX}{image_id}_t.webp",
-    ]
-    try:
-        await asyncio.to_thread(
-            s3.delete_objects,
-            Bucket=R2_BUCKET_NAME,
-            Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True},
-        )
-    except Exception:
-        # TTL will eventually clean these up if delete fails here.
-        logger.exception("Failed to delete removed image files (non-fatal)")
+        keys = [
+            f"{PENDING_PREFIX}{image_id}{img['ext']}",
+            f"{PENDING_PREFIX}{image_id}_p.webp",
+            f"{PENDING_PREFIX}{image_id}_t.webp",
+        ]
+        try:
+            await asyncio.to_thread(_delete_objects_chunked_sync, keys)
+        except Exception:
+            # TTL will eventually clean these up if delete fails here.
+            logger.exception("Failed to delete removed image files (non-fatal)")
 
-    s["images"] = [i for i in s.get("images", []) if i.get("id") != image_id]
-    await _write_suggestion(s)
+        s["images"] = [i for i in s.get("images", []) if i.get("id") != image_id]
+        await _write_suggestion(s)
     return s
 
 
 @app.delete("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
 async def delete_suggestion(suggestion_id: str):
     _validate_id(suggestion_id, "suggestion")
-    s = await _read_suggestion(suggestion_id)
-    if not s:
-        raise HTTPException(status_code=404, detail="Suggestion not found")
+    async with _suggestion_lock(suggestion_id):
+        s = await _read_suggestion(suggestion_id)
+        if not s:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
 
-    keys_to_delete: list[str] = []
-    for img in s.get("images", []):
-        if img.get("status") == "approved":
-            continue
-        keys_to_delete.extend([
-            f"{PENDING_PREFIX}{img['id']}{img['ext']}",
-            f"{PENDING_PREFIX}{img['id']}_p.webp",
-            f"{PENDING_PREFIX}{img['id']}_t.webp",
-        ])
+        keys_to_delete: list[str] = []
+        for img in s.get("images", []):
+            if img.get("status") == "approved":
+                continue
+            keys_to_delete.extend([
+                f"{PENDING_PREFIX}{img['id']}{img['ext']}",
+                f"{PENDING_PREFIX}{img['id']}_p.webp",
+                f"{PENDING_PREFIX}{img['id']}_t.webp",
+            ])
 
-    if keys_to_delete:
-        try:
-            await asyncio.to_thread(
-                s3.delete_objects,
-                Bucket=R2_BUCKET_NAME,
-                Delete={"Objects": [{"Key": k} for k in keys_to_delete], "Quiet": True},
-            )
-        except Exception:
-            logger.exception("Failed to delete pending images during suggestion deletion (non-fatal)")
+        if keys_to_delete:
+            try:
+                await asyncio.to_thread(_delete_objects_chunked_sync, keys_to_delete)
+            except Exception:
+                logger.exception("Failed to delete pending images during suggestion deletion (non-fatal)")
 
-    await asyncio.to_thread(_delete_suggestion_sync, suggestion_id)
+        await asyncio.to_thread(_delete_suggestion_sync, suggestion_id)
     return {"deleted": True, "id": suggestion_id}
 
 
