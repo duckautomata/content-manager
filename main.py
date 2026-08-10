@@ -2106,5 +2106,18 @@ async def delete_suggestion(suggestion_id: str):
 
 # ---------------- Static ----------------
 
+class RevalidatedStaticFiles(StaticFiles):
+    """StaticFiles that makes every cache (browser and CDN edge) revalidate
+    before reuse. Without this, an edge cache like Cloudflare holds .js/.css by
+    file extension but never .html, so a deploy serves new HTML with the last
+    release's script and the UI crashes on DOM lookups that no longer exist.
+    Revalidation is cheap: responses carry ETags, so an unchanged file is a 304."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 os.makedirs("static", exist_ok=True)
-app.mount("/", StaticFiles(directory="static", html=True), name="static")
+app.mount("/", RevalidatedStaticFiles(directory="static", html=True), name="static")
