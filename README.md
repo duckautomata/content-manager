@@ -197,7 +197,7 @@ Response headers from `/strip`: `X-Strip-Format`, `X-Strip-Changed`, `X-Strip-Ve
 
 | Format          | How metadata is removed                                                                          |
 |-----------------|--------------------------------------------------------------------------------------------------|
-| JPEG            | EXIF, XMP, Photoshop/IPTC, comments and other `APPn` segments dropped; JFIF, ICC and the Adobe colour-transform marker kept; data appended after the end of the image dropped |
+| JPEG            | EXIF, XMP, Photoshop/IPTC, comments and other `APPn` segments dropped; JFIF, ICC and the Adobe colour-transform marker kept. Anything appended after the end of the image goes too — where a phone's MPF index points, that is a second picture: the frames of a motion photo (with audio), a depth map, an HDR gain map. Reported as `jpeg:appended-images` |
 | PNG / APNG      | `eXIf`, text (`tEXt`/`zTXt`/`iTXt`, where XMP lives), `tIME` and unknown chunks dropped; APNG control chunks and all colour chunks kept |
 | WebP            | `EXIF` and `XMP` chunks dropped, **and** the `VP8X` feature flags and RIFF length rewritten to match — the step whose absence broke Discord's animated WebPs |
 | GIF             | Comment blocks, XMP and other application extensions dropped; the NETSCAPE loop count and ICC extension kept |

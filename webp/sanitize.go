@@ -178,7 +178,7 @@ func verifyStrip(original, stripped []byte) error {
 	if before.Bands() != after.Bands() {
 		return fmt.Errorf("band count changed from %d to %d", before.Bands(), after.Bands())
 	}
-	if before.Orientation() != after.Orientation() {
+	if uprightOrientation(before) != uprightOrientation(after) {
 		return fmt.Errorf("orientation changed from %d to %d", before.Orientation(), after.Orientation())
 	}
 	if before.HasICCProfile() != after.HasICCProfile() {
@@ -225,6 +225,18 @@ func verifyStrip(original, stripped []byte) error {
 		}
 	}
 	return nil
+}
+
+// uprightOrientation reads an image's orientation as the transform a viewer
+// would apply. An EXIF orientation of 1 and no orientation at all both mean
+// "upright" - libvips reports the second as 0 - so a file whose only EXIF was a
+// synthesized upright marker must not count as changed when that marker goes.
+func uprightOrientation(img *vips.ImageRef) int {
+	orientation := img.Orientation()
+	if orientation < 1 || orientation > 8 {
+		return 1
+	}
+	return orientation
 }
 
 // ---------------- EXIF helpers ----------------
@@ -312,6 +324,10 @@ func stripJPEG(buf []byte) ([]byte, []string, error) {
 	out := make([]byte, 0, len(buf))
 	out = append(out, 0xFF, 0xD8)
 	var removed []string
+	// An MPF index means the bytes after the end of this image are not padding
+	// but whole extra pictures: the frames of a motion photo, a depth map, an
+	// HDR gain map. Worth saying so when they are dropped.
+	appendedImages := false
 
 	i := 2
 	for i+1 < len(buf) {
@@ -331,7 +347,11 @@ func stripJPEG(buf []byte) ([]byte, []string, error) {
 		if marker == 0xD9 { // EOI
 			out = append(out, 0xFF, 0xD9)
 			if j+1 < len(buf) {
-				removed = append(removed, "trailing-data")
+				if appendedImages {
+					removed = append(removed, "jpeg:appended-images")
+				} else {
+					removed = append(removed, "jpeg:trailing-data")
+				}
 			}
 			return out, removed, nil
 		}
@@ -352,6 +372,9 @@ func stripJPEG(buf []byte) ([]byte, []string, error) {
 
 		if replacement, label, drop := jpegMetadataSegment(marker, payload); drop {
 			removed = append(removed, label)
+			if label == "jpeg:mpf" {
+				appendedImages = true
+			}
 			if replacement != nil {
 				out = append(out, 0xFF, marker)
 				out = binary.BigEndian.AppendUint16(out, uint16(len(replacement)+2))
@@ -430,7 +453,7 @@ func jpegMetadataSegment(marker byte, payload []byte) (replacement []byte, label
 			return nil, "", false // colour profile: keep
 		}
 		if hasPrefix("MPF\x00") {
-			return nil, "jpeg:mpf", true // index of appended images, which we also drop
+			return nil, "jpeg:mpf", true // index of the appended images dropped below
 		}
 		return nil, "jpeg:app2", true
 	case 0xED: // APP13, Photoshop image resources (IPTC lives here)
