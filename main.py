@@ -367,6 +367,23 @@ class _Benchmark:
 
 # ---------------- Image conversion + storage ----------------
 
+# mimetypes maps .apng to Mozilla's old vendor type; browsers use image/apng.
+_EXTENSION_MIME_OVERRIDES = {"apng": "image/apng"}
+
+
+def _resolve_mime(file_name: str, declared: str | None) -> str:
+    """Work out an upload's content type. Browsers send a usable one, but API
+    clients and curl routinely send application/octet-stream, and an image that
+    arrives as a generic blob would be stored as-is: no preview, no thumbnail,
+    and no metadata stripping."""
+    if declared and declared != "application/octet-stream":
+        return declared
+    ext = os.path.splitext(file_name)[1].lower().lstrip(".")
+    if ext in _EXTENSION_MIME_OVERRIDES:
+        return _EXTENSION_MIME_OVERRIDES[ext]
+    return mimetypes.guess_type(file_name)[0] or declared or "application/octet-stream"
+
+
 async def _convert_and_store(
     *, content: bytes, mime: str, original_ext: str, original_name: str, prefix: str
 ) -> dict:
@@ -391,21 +408,35 @@ async def _convert_and_store(
         preview_key = f"{prefix}{short_uuid}_p.webp"
         thumbnail_key = f"{prefix}{short_uuid}_t.webp"
 
-        with bench.stage("convert"):
-            preview_resp, thumb_resp = await asyncio.gather(
+        # The stored original keeps the pixels the uploader sent: the strip is a
+        # container-level edit, not a re-encode. Videos are passed through.
+        strip_original = not mime.startswith("video/")
+        calls = [
+            client.post(
+                f"{CONVERSION_SERVICE_URL}/convert",
+                content=content,
+                headers={"Content-Type": mime},
+            ),
+            client.post(
+                f"{CONVERSION_SERVICE_URL}/thumbnail",
+                params={"height": 128},
+                content=content,
+                headers={"Content-Type": mime},
+            ),
+        ]
+        if strip_original:
+            calls.append(
                 client.post(
-                    f"{CONVERSION_SERVICE_URL}/convert",
+                    f"{CONVERSION_SERVICE_URL}/strip",
                     content=content,
                     headers={"Content-Type": mime},
-                ),
-                client.post(
-                    f"{CONVERSION_SERVICE_URL}/thumbnail",
-                    params={"height": 128},
-                    content=content,
-                    headers={"Content-Type": mime},
-                ),
-                return_exceptions=True,
+                )
             )
+
+        with bench.stage("convert"):
+            responses = await asyncio.gather(*calls, return_exceptions=True)
+        preview_resp, thumb_resp = responses[0], responses[1]
+        strip_resp = responses[2] if strip_original else None
 
         def _conversion_content(resp, what: str) -> bytes:
             if isinstance(resp, BaseException):
@@ -421,8 +452,24 @@ async def _convert_and_store(
         preview_content = _conversion_content(preview_resp, "Conversion failed")
         thumb_content = _conversion_content(thumb_resp, "Thumbnail conversion failed")
 
+        original_content = content
+        if strip_resp is not None:
+            original_content = _conversion_content(strip_resp, "Metadata strip failed")
+            if strip_resp.headers.get("X-Strip-Changed") == "true":
+                logger.info(
+                    "Stripped metadata from %s%s: %s (%d -> %d bytes)",
+                    short_uuid, original_ext,
+                    strip_resp.headers.get("X-Strip-Removed", ""),
+                    len(content), len(original_content),
+                )
+            elif strip_resp.headers.get("X-Strip-Note"):
+                logger.info(
+                    "No metadata removed from %s%s: %s",
+                    short_uuid, original_ext, strip_resp.headers["X-Strip-Note"],
+                )
+
     uploads = [
-        (original_key, content, mime),
+        (original_key, original_content, mime),
         (preview_key, preview_content, "image/webp"),
         (thumbnail_key, thumb_content, "image/webp"),
     ]
@@ -1139,7 +1186,7 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
 
         content = await file.read()
         file_name = file.filename or "default-filename"
-        mime_type = file.content_type or mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        mime_type = _resolve_mime(file_name, file.content_type)
         original_ext = os.path.splitext(file_name)[1]
 
         is_image = mime_type.startswith("image/")
@@ -1726,7 +1773,7 @@ async def public_upload_image(
             detail=f"Unsupported format: {ext_lower or '(none)'}",
         )
 
-    mime = file.content_type or mimetypes.guess_type(file_name)[0] or ""
+    mime = _resolve_mime(file_name, file.content_type)
     if not (mime.startswith("image/") or mime.startswith("video/")):
         raise HTTPException(status_code=415, detail="Only image or video uploads are accepted")
 

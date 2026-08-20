@@ -67,6 +67,16 @@ func loadConfig() {
 			webpEffort = n
 		}
 	}
+	if v := os.Getenv("MAX_ANIM_FRAMES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxAnimationFrames = n
+		}
+	}
+	if v := os.Getenv("MAX_ANIM_PIXELS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxFilmstripPixels = n
+		}
+	}
 	concurrency := runtime.NumCPU()
 	if v := os.Getenv("MAX_CONCURRENCY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -74,8 +84,8 @@ func loadConfig() {
 		}
 	}
 	convertSem = make(chan struct{}, concurrency)
-	log.Printf("config: maxUpload=%dMB webpQuality=%d webpEffort=%d maxConcurrency=%d",
-		maxUploadBytes/(1024*1024), webpQuality, webpEffort, concurrency)
+	log.Printf("config: maxUpload=%dMB webpQuality=%d webpEffort=%d maxConcurrency=%d maxAnimFrames=%d maxAnimPixels=%d",
+		maxUploadBytes/(1024*1024), webpQuality, webpEffort, concurrency, maxAnimationFrames, maxFilmstripPixels)
 }
 
 func main() {
@@ -110,6 +120,7 @@ func main() {
 	mux.HandleFunc("/info", limit(handleInfo))
 	mux.HandleFunc("/convert", limit(handleConvert))
 	mux.HandleFunc("/thumbnail", limit(handleThumbnail))
+	mux.HandleFunc("/strip", limit(handleStrip))
 	mux.HandleFunc("/bulk", limit(handleBulk))
 	mux.HandleFunc("/slug", handleSlug)
 	mux.HandleFunc("/formats", handleFormats)
@@ -235,8 +246,21 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	width := img.Width()
 	height := img.PageHeight()
 	pages := img.Metadata().Pages
-	isAnimated := pages > 1
 	format := strings.ToLower(vips.ImageTypes[img.Metadata().Format])
+	if pages <= 1 && sniffAnimated(buf) {
+		// APNG and animated AVIF look like stills to libvips; ask ffmpeg.
+		if frames, err := countAnimationFrames(buf); err == nil {
+			pages = frames
+			if format == "png" {
+				format = "apng"
+			}
+		} else {
+			log.Printf("warning: could not count frames: %v", err)
+		}
+	}
+	isAnimated := pages > 1
+
+	metadataFound := detectMetadata(buf)
 
 	mimeType := "application/octet-stream"
 	switch format {
@@ -261,13 +285,17 @@ func handleInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"width":       width,
-		"height":      height,
-		"format":      format,
-		"mime_type":   mimeType,
-		"hash":        hashString,
-		"is_animated": isAnimated,
-		"pages":       pages,
+		"width":            width,
+		"height":           height,
+		"format":           format,
+		"mime_type":        mimeType,
+		"hash":             hashString,
+		"is_animated":      isAnimated,
+		"pages":            pages,
+		"orientation":      img.Orientation(),
+		"has_icc_profile":  img.HasICCProfile(),
+		"has_metadata":     len(metadataFound) > 0,
+		"metadata_removed": metadataFound,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -285,7 +313,7 @@ func handleConvert(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	img, err := loadImage(buf, r.Header.Get("Content-Type"))
+	img, err := loadImage(buf, r.Header.Get("Content-Type"), 0)
 	if err != nil {
 		http.Error(w, "Failed to load image", http.StatusBadRequest)
 		return
@@ -313,30 +341,80 @@ func handleThumbnail(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	img, err := loadImage(buf, r.Header.Get("Content-Type"))
+	img, err := loadImage(buf, r.Header.Get("Content-Type"), targetHeight)
 	if err != nil {
 		http.Error(w, "Failed to load image", http.StatusBadRequest)
 		return
 	}
 	defer img.Close()
 
-	currentHeight := img.PageHeight()
-	if currentHeight > targetHeight {
-		scale := float64(targetHeight) / float64(currentHeight)
-
-		if err := img.Resize(scale, vips.KernelLanczos3); err != nil {
-			http.Error(w, "Failed to resize", http.StatusInternalServerError)
-			return
-		}
-
-		if img.Metadata().Pages > 1 {
-			if err := img.SetPageHeight(targetHeight); err != nil {
-				fmt.Printf("Warning: Failed to set page height: %v\n", err)
-			}
-		}
+	if err := scaleToHeight(img, targetHeight); err != nil {
+		http.Error(w, "Failed to resize", http.StatusInternalServerError)
+		return
 	}
 
 	sendWebP(w, img)
+}
+
+// POST /strip - Removes EXIF and other descriptive metadata, returning the
+// image in its original format with its pixels untouched. Details of what was
+// removed come back in X-Strip-* headers so a caller can log or skip a
+// no-op result.
+func handleStrip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	buf, ok := readLimitedBody(w, r)
+	if !ok {
+		return
+	}
+
+	out, report, err := stripMetadata(buf)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Strip failed: %v", err), http.StatusBadRequest)
+		return
+	}
+	if report.Note != "" {
+		log.Printf("strip: %s (%s)", report.Note, report.Format)
+	}
+
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" || contentType == "application/octet-stream" {
+		contentType = mimeForFormat(report.Format)
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("X-Strip-Format", report.Format)
+	w.Header().Set("X-Strip-Changed", strconv.FormatBool(report.Changed))
+	w.Header().Set("X-Strip-Verified", strconv.FormatBool(report.Verified))
+	w.Header().Set("X-Strip-Removed", joinLabels(report.Removed))
+	if report.Note != "" {
+		w.Header().Set("X-Strip-Note", report.Note)
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+	w.Write(out)
+}
+
+func mimeForFormat(format string) string {
+	switch format {
+	case "jpeg":
+		return "image/jpeg"
+	case "png":
+		return "image/png"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	case "isobmff":
+		return "image/avif"
+	case "tiff":
+		return "image/tiff"
+	case "bmp":
+		return "image/bmp"
+	}
+	return "application/octet-stream"
 }
 
 // POST /bulk?height=X(optional) - Zip in, Zip out (All converted to WebP)
@@ -505,7 +583,10 @@ func looksLikeVideo(buf []byte, contentType string) bool {
 	}
 	if len(buf) >= 12 {
 		if string(buf[4:8]) == "ftyp" { // MP4 / MOV / ISO-BMFF
-			return true
+			// AVIF and HEIC share the container with MP4. Handing them to
+			// ffmpeg would flatten them to a single frame, so let libvips (and
+			// the animated-image path) have them instead.
+			return !isISOBMFFImage(buf)
 		}
 		if buf[0] == 0x1A && buf[1] == 0x45 && buf[2] == 0xDF && buf[3] == 0xA3 { // Matroska / WebM
 			return true
@@ -536,7 +617,11 @@ func extractVideoFrame(vidBuf []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func loadImage(buf []byte, contentType string) (*vips.ImageRef, error) {
+// loadImage decodes an upload into a libvips image, keeping every frame of an
+// animation. maxHeight is a hint: when the caller is about to scale the image
+// down anyway, animations decoded through ffmpeg are shrunk during decoding
+// instead of afterwards. Pass 0 for full size.
+func loadImage(buf []byte, contentType string, maxHeight int) (*vips.ImageRef, error) {
 	if looksLikeVideo(buf, contentType) {
 		frameBuf, err := extractVideoFrame(buf)
 		if err == nil && len(frameBuf) > 0 {
@@ -544,8 +629,33 @@ func loadImage(buf []byte, contentType string) (*vips.ImageRef, error) {
 		} else {
 			log.Printf("warning: failed to extract video frame: %v", err)
 		}
+		// A single extracted frame is never animated.
+		return loadImageBuffer(buf)
 	}
 
+	img, err := loadImageBuffer(buf)
+	if err == nil && img.Metadata().Pages > 1 {
+		return img, nil // libvips already has every frame
+	}
+
+	// APNG and animated AVIF decode to a single frame in libvips: PNG loaders
+	// ignore acTL/fcTL, and libheif only reads the still primary item. Fall
+	// back to ffmpeg, which understands both.
+	if !sniffAnimated(buf) {
+		return img, err
+	}
+	anim, animErr := decodeAnimation(buf, maxHeight)
+	if animErr == nil {
+		if img != nil {
+			img.Close()
+		}
+		return anim, nil
+	}
+	log.Printf("warning: animated decode failed, falling back to a still frame: %v", animErr)
+	return img, err
+}
+
+func loadImageBuffer(buf []byte) (*vips.ImageRef, error) {
 	params := vips.NewImportParams()
 	params.NumPages.Set(-1)
 	return vips.LoadImageFromBuffer(buf, params)
@@ -564,12 +674,88 @@ func sendWebP(w http.ResponseWriter, img *vips.ImageRef) {
 }
 
 func exportToWebP(img *vips.ImageRef) ([]byte, error) {
+	if err := prepareForExport(img); err != nil {
+		return nil, err
+	}
+
 	p := vips.NewWebpExportParams()
 	p.Quality = webpQuality
 	p.ReductionEffort = webpEffort
+	p.StripMetadata = true
 
 	data, _, err := img.ExportWebp(p)
 	return data, err
+}
+
+// prepareForExport makes an image safe to save without its metadata.
+//
+// Dropping metadata is only harmless once the two tags that change how an image
+// is displayed have been resolved into the pixels themselves: EXIF orientation
+// (otherwise a phone photo comes out on its side) and the colour profile
+// (otherwise a wide-gamut or CMYK source is reinterpreted as sRGB and the
+// colours shift). Both are applied here, then everything descriptive goes.
+func prepareForExport(img *vips.ImageRef) error {
+	// Rotating an animation would spin the whole filmstrip rather than each
+	// frame, and animated formats do not carry orientation in practice.
+	if img.Metadata().Pages <= 1 {
+		if err := img.AutoRotate(); err != nil {
+			return fmt.Errorf("autorotate: %w", err)
+		}
+	}
+	// Converts the pixels into sRGB and tags them with a ~500 byte standard
+	// profile; a no-op for images that are already untagged sRGB.
+	if err := img.OptimizeICCProfile(); err != nil {
+		log.Printf("warning: could not normalise the colour profile: %v", err)
+	}
+	// Drops EXIF, XMP, IPTC and friends. Colour profile, orientation and the
+	// animation fields (pages, page height, delay, loop) are kept by govips
+	// because the encoder still needs them.
+	if err := img.RemoveMetadata(); err != nil {
+		return fmt.Errorf("remove metadata: %w", err)
+	}
+	return nil
+}
+
+// scaleToHeight shrinks an image so each frame is at most targetHeight tall.
+// For an animation libvips holds every frame in one tall image, so the page
+// height has to be restated afterwards - and it has to match what the resize
+// actually produced, or the encoder slices the frames in the wrong places.
+func scaleToHeight(img *vips.ImageRef, targetHeight int) error {
+	pages := img.Metadata().Pages
+	if pages < 1 {
+		pages = 1
+	}
+	if img.PageHeight() <= targetHeight {
+		return nil
+	}
+
+	scale := float64(targetHeight) / float64(img.PageHeight())
+	if pages > 1 {
+		// Scale the strip as a whole so its height stays an exact multiple of
+		// the frame count.
+		scale = float64(targetHeight*pages) / float64(img.Height())
+	}
+	if err := img.Resize(scale, vips.KernelLanczos3); err != nil {
+		return err
+	}
+	if pages > 1 {
+		pageHeight := img.Height() / pages
+		if pageHeight < 1 {
+			return fmt.Errorf("resized height %d is too small for %d frames", img.Height(), pages)
+		}
+		// Rounding can leave the strip a row or two short of an exact multiple
+		// of the frame count; trim rather than let the encoder cut the frames
+		// in the wrong places.
+		if pageHeight*pages != img.Height() {
+			if err := img.ExtractArea(0, 0, img.Width(), pageHeight*pages); err != nil {
+				return fmt.Errorf("trim filmstrip: %w", err)
+			}
+		}
+		if err := img.SetPageHeight(pageHeight); err != nil {
+			return fmt.Errorf("set page height: %w", err)
+		}
+	}
+	return nil
 }
 
 func processImageToWebP(file *zip.File, targetHeight int) ([]byte, error) {
@@ -584,21 +770,15 @@ func processImageToWebP(file *zip.File, targetHeight int) ([]byte, error) {
 		return nil, err
 	}
 
-	params := vips.NewImportParams()
-	params.NumPages.Set(-1)
-	img, err := vips.LoadImageFromBuffer(buf, params)
+	img, err := loadImage(buf, "", targetHeight)
 	if err != nil {
 		return nil, err
 	}
 	defer img.Close()
 
-	if targetHeight > 0 && img.PageHeight() > targetHeight {
-		scale := float64(targetHeight) / float64(img.PageHeight())
-		if err := img.Resize(scale, vips.KernelLanczos3); err != nil {
+	if targetHeight > 0 {
+		if err := scaleToHeight(img, targetHeight); err != nil {
 			return nil, err
-		}
-		if img.Metadata().Pages > 1 {
-			img.SetPageHeight(targetHeight)
 		}
 	}
 
@@ -661,6 +841,7 @@ const htmlContent = `
         <button onclick="process('info')" class="secondary">Get Info</button>
         <button onclick="process('convert')">Convert to WebP</button>
         <button onclick="process('thumbnail')">Generate Thumbnail</button>
+        <button onclick="process('strip')" class="secondary">Strip Metadata</button>
         <button onclick="process('bulk')" style="background-color: #28a745;">Batch Zip</button>
     </div>
 
@@ -750,6 +931,8 @@ const htmlContent = `
                 
                 if (action === 'bulk') {
                     a.download = "converted_webp.zip";
+                } else if (action === 'strip') {
+                    a.download = "stripped_" + selectedFile.name;
                 } else {
                     a.download = newName + ".webp";
                 }
@@ -759,6 +942,19 @@ const htmlContent = `
                 a.remove();
                 window.URL.revokeObjectURL(downloadUrl);
                 status.innerText = "Download started!";
+
+                if (action === 'strip') {
+                    const removed = response.headers.get('X-Strip-Removed');
+                    const changed = response.headers.get('X-Strip-Changed') === 'true';
+                    output.innerHTML = '<pre>' + JSON.stringify({
+                        format: response.headers.get('X-Strip-Format'),
+                        changed: changed,
+                        verified: response.headers.get('X-Strip-Verified') === 'true',
+                        removed: removed ? removed.split(',') : [],
+                        note: response.headers.get('X-Strip-Note') || '',
+                        bytes: selectedFile.size + ' -> ' + blob.size
+                    }, null, 2) + '</pre>';
+                }
 
             } catch (err) {
                 status.innerText = "Error: " + err.message;

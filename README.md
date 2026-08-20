@@ -7,6 +7,7 @@ _System_
 
 - **[Content Manager](#content-manager)**
 - **[Image Converter](#webp-converter)**
+- **[Metadata Removal](#metadata-removal)**
 
 _Development_
 
@@ -31,9 +32,13 @@ It also exposes a **public suggestion API** that lets external sites (e.g. dokim
 
 ### Image Converter
 
-The image converter is the golang part of the codebase located under the [webp/](/webp/) folder. It is used to extract info from the image and convert any image to webp.
+The image converter is the golang part of the codebase located under the [webp/](/webp/) folder. It is used to extract info from the image, convert any image to webp, and strip metadata from the original.
 
 This will only be called if the uploaded file is an image.
+
+**Animation.** GIF and WebP animations are decoded by libvips. APNG and animated AVIF are not — PNG decoders ignore the APNG frame chunks, and libheif only reads the still image out of an AVIF, so both used to come out as a static preview. Those two formats are now decoded with ffmpeg into a stack of frames that libvips understands, so their previews and thumbnails animate like any other. Long or very large animations are cut to a frame and pixel budget (`MAX_ANIM_FRAMES`, `MAX_ANIM_PIXELS`).
+
+**Metadata.** See [Metadata removal](#metadata-removal).
 
 ## Development
 
@@ -134,12 +139,71 @@ optional:
 | `WEBP_EFFORT`      | `4`            | WebP compression effort (0–6; higher = smaller but slower).  |
 | `MAX_CONCURRENCY`  | CPU core count | Max simultaneous conversions (protects small hosts).         |
 | `VIPS_CONCURRENCY` | `0`            | libvips threads per operation (`0` = libvips default).       |
+| `MAX_ANIM_FRAMES`  | `300`          | Frames kept from an APNG / animated AVIF; the rest are cut.  |
+| `MAX_ANIM_PIXELS`  | `50000000`     | Pixel budget across all frames of one such animation.        |
+
+### Converter endpoints
+
+| Method | Path                    | Purpose                                                                          |
+|--------|-------------------------|----------------------------------------------------------------------------------|
+| POST   | `/info`                  | Dimensions, format, hash, frame count, orientation, and what metadata it carries |
+| POST   | `/convert`               | Full-size WebP (animated if the source is)                                       |
+| POST   | `/thumbnail?height=N`    | WebP scaled to N pixels tall                                                     |
+| POST   | `/strip`                 | The same file with its metadata removed (see below)                              |
+| POST   | `/bulk?height=N`         | Zip of images in, zip of WebPs out                                               |
+| GET    | `/slug?name=`            | Slug and short uuid for a name                                                   |
+| GET    | `/formats`               | Accepted input extensions                                                        |
 
 ### Building new image
 To build a new image with the latest tag, run
 ```bash
 ./build.sh
 ```
+
+## Metadata removal
+
+Uploads carry more than pixels: camera model, GPS coordinates, timestamps, editing
+history, XMP and IPTC records. All of it is removed, in two places:
+
+- **The original**, before it is stored, via `POST /strip`. The file is edited at the
+  container level and never re-encoded, so the stored image is bit-for-bit the one that
+  was uploaded apart from the metadata. Videos are stored as uploaded.
+- **The preview and thumbnail**, when they are encoded.
+
+What is *not* removed is anything that decides how the image looks. Colour profiles,
+palettes, transparency, gamma and animation control blocks all stay. Two cases get
+special handling:
+
+- **EXIF orientation** is the one descriptive tag that changes rendering. Deleting it
+  alone would leave phone photos lying on their side, so the original keeps a minimal
+  EXIF block holding nothing but the orientation, and the WebP versions have the
+  rotation applied to the pixels instead.
+- **Colour profiles** are converted rather than discarded: a wide-gamut or CMYK source
+  is transformed into sRGB before its profile is dropped, so the colours a viewer sees
+  do not shift.
+
+Each strip is verified before it is used. The converter decodes the original and the
+stripped copy and compares dimensions, frame count, frame height, bands, alpha,
+orientation, colour profile presence and every pixel; if anything differs, or either
+copy fails to decode, the original bytes are returned untouched and the reason is
+reported in the `X-Strip-Note` header. This is what keeps a bug in one of the container
+editors from doing what [Discord's EXIF removal did to their animated WebP
+uploads](https://discord.com/blog/modern-image-formats-at-discord-supporting-webp-and-avif):
+removing a chunk while leaving the container's own bookkeeping describing a file that no
+longer existed.
+
+Response headers from `/strip`: `X-Strip-Format`, `X-Strip-Changed`, `X-Strip-Verified`,
+`X-Strip-Removed` (a comma-separated list such as `jpeg:exif,jpeg:xmp`), `X-Strip-Note`.
+
+| Format          | How metadata is removed                                                                          |
+|-----------------|--------------------------------------------------------------------------------------------------|
+| JPEG            | EXIF, XMP, Photoshop/IPTC, comments and other `APPn` segments dropped; JFIF, ICC and the Adobe colour-transform marker kept; data appended after the end of the image dropped |
+| PNG / APNG      | `eXIf`, text (`tEXt`/`zTXt`/`iTXt`, where XMP lives), `tIME` and unknown chunks dropped; APNG control chunks and all colour chunks kept |
+| WebP            | `EXIF` and `XMP` chunks dropped, **and** the `VP8X` feature flags and RIFF length rewritten to match — the step whose absence broke Discord's animated WebPs |
+| GIF             | Comment blocks, XMP and other application extensions dropped; the NETSCAPE loop count and ICC extension kept |
+| AVIF / HEIC     | EXIF and XMP item payloads overwritten in place and metadata boxes retyped to `free`, because the format addresses its own data by absolute file offset and cannot be shortened safely |
+| TIFF            | Descriptive tags removed from each directory and their values zeroed, including the EXIF and GPS sub-directories |
+| BMP, everything else | Left alone (nothing to remove, or the format is not understood)                             |
 
 ## Public Suggestion API
 

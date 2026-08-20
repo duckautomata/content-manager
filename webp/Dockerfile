@@ -51,7 +51,7 @@ RUN wget https://github.com/libvips/libvips/releases/download/v${VIPS_VERSION}/v
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go .
+COPY *.go .
 RUN CGO_ENABLED=1 GOOS=linux go build -ldflags="-s -w" -o server .
 
 

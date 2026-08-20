@@ -24,6 +24,8 @@ services:
       - MAX_UPLOAD_MB=25       # max size of a single upload (matches the app's public cap)
       - WEBP_QUALITY=75        # output quality, 1-100
       - WEBP_EFFORT=4          # compression effort, 0-6 (higher = smaller + slower)
+      # - MAX_ANIM_FRAMES=300  # frames kept from an animation libvips cannot decode (APNG, animated AVIF)
+      # - MAX_ANIM_PIXELS=50000000  # pixel budget for those animations, across all frames
       # - MAX_CONCURRENCY=4    # max simultaneous conversions (default: CPU core count)
       # - VIPS_CONCURRENCY=0   # libvips threads per operation (0 = libvips default)
     networks:
