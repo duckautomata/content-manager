@@ -2,8 +2,8 @@
 // each with byte-level progress via XMLHttpRequest; results stay in the tray
 // (with Copy ID) until the user clears them.
 
-import { el, icon, api, getApiKey, requireLogin, ApiError, fmt, detailFrom, extOf } from './common.js';
-import { copyWithFeedback, toast } from './ui.js';
+import { el, icon, api, getApiKey, requireLogin, ApiError, fmt, detailFrom, extOf, copyText } from './common.js';
+import { toast } from './ui.js';
 
 const CONCURRENCY = 2;
 
@@ -59,7 +59,7 @@ export function createUploader({ getPrefix, thumbUrl = () => '', onDone = () => 
     function add(files, { overrideFilename = null } = {}) {
         const prefix = getPrefix();
         for (const file of files) {
-            const it = { id: nextId++, file, name: file.name, size: file.size, status: 'queued', pct: 0, prefix, overrideFilename, result: null, detail: '', controller: null, node: null };
+            const it = { id: nextId++, file, name: file.name, size: file.size, status: 'queued', pct: 0, prefix, overrideFilename, result: null, detail: '', controller: null, node: null, copied: false };
             items.push(it);
             it.node = renderRow(it);
             list.prepend(it.node);
@@ -171,6 +171,19 @@ export function createUploader({ getPrefix, thumbUrl = () => '', onDone = () => 
         return (r.key || '').split('/').pop();
     }
 
+    const isMediaDone = (it) => it.status === 'done' && it.result && (it.result.type === 'image' || it.result.type === 'video');
+
+    // Copying an ID marks its row so it is obvious which IDs still need copying.
+    async function copyId(it) {
+        const ok = await copyText(slugOf(it));
+        if (!ok) { toast('Copy failed. Your browser blocked clipboard access.', { tone: 'error' }); return; }
+        it.copied = true;
+        updateRow(it);
+        renderSummary();
+        const fresh = it.node && it.node.querySelector('.tray-row__actions .btn');
+        if (fresh) fresh.focus({ preventScroll: true });
+    }
+
     function renderSummary() {
         const total = items.length;
         const done = items.filter(it => it.status === 'done').length;
@@ -182,9 +195,12 @@ export function createUploader({ getPrefix, thumbUrl = () => '', onDone = () => 
         if (active) parts.push(`${active} in progress`);
         if (failed) parts.push(`${failed} failed`);
         if (cancelled) parts.push(`${cancelled} cancelled`);
+        const media = items.filter(isMediaDone);
+        const uncopied = media.filter(it => !it.copied).length;
+        if (media.length) parts.push(uncopied ? `${fmt.plural(uncopied, 'ID')} not copied yet` : 'all IDs copied');
         summary.textContent = announced ? `${parts.join(' · ')} — ${announced}` : parts.join(' · ');
-        const ids = items.filter(it => it.status === 'done' && it.result && (it.result.type === 'image' || it.result.type === 'video')).map(slugOf);
-        copyAllBtn.hidden = ids.length < 2;
+        copyAllBtn.hidden = media.length < 2;
+        copyAllBtn.textContent = uncopied && uncopied < media.length ? `Copy all IDs (${uncopied} left)` : 'Copy all IDs';
         cancelAllBtn.hidden = !items.some(isCancellable);
     }
 
@@ -222,8 +238,11 @@ export function createUploader({ getPrefix, thumbUrl = () => '', onDone = () => 
 
     function updateRow(it, row = it.node) {
         if (!row) return;
-        row.className = `tray-row tray-row--${it.status}`;
+        row.className = `tray-row tray-row--${it.status}${it.copied ? ' tray-row--copied' : ''}`;
         row.querySelector('.tray-row__state').textContent = statusText(it);
+        const mark = row.querySelector('.tray-row__copied');
+        if (it.copied && !mark) row.querySelector('.tray-row__status').append(el('span', { class: 'chip chip--success tray-row__copied' }, icon('check'), 'copied'));
+        else if (!it.copied && mark) mark.remove();
         const bar = row.querySelector('.tray-row__bar');
         bar.style.setProperty('--pct', String(it.status === 'done' ? 100 : it.pct));
         bar.setAttribute('aria-valuenow', String(it.status === 'done' ? 100 : it.pct));
@@ -243,16 +262,23 @@ export function createUploader({ getPrefix, thumbUrl = () => '', onDone = () => 
                     t.replaceChildren(el('img', { src: url, alt: '', loading: 'lazy' }));
                 }
                 const slug = slugOf(it);
-                const btn = el('button', { type: 'button', class: 'btn btn--sm', 'aria-label': `Copy ID ${slug}` }, icon('copy'), el('span', { class: 'btn__label', text: 'Copy ID' }));
-                btn.addEventListener('click', () => copyWithFeedback(btn, slug));
+                const btn = el('button', {
+                    type: 'button', class: `btn btn--sm${it.copied ? ' btn--ghost' : ''}`,
+                    'aria-label': it.copied ? `Copy ID ${slug} again` : `Copy ID ${slug}`, 'aria-pressed': it.copied ? 'true' : 'false',
+                }, icon(it.copied ? 'check' : 'copy'), el('span', { class: 'btn__label', text: it.copied ? 'Copied' : 'Copy ID' }));
+                btn.addEventListener('click', () => copyId(it));
                 actions.append(btn);
             }
         }
     }
 
-    copyAllBtn.addEventListener('click', () => {
-        const ids = items.filter(it => it.status === 'done' && it.result && (it.result.type === 'image' || it.result.type === 'video')).map(slugOf);
-        copyWithFeedback(copyAllBtn, ids.join('\n'), { toastOnSuccess: `Copied ${fmt.plural(ids.length, 'ID')}` });
+    copyAllBtn.addEventListener('click', async () => {
+        const media = items.filter(isMediaDone);
+        const ok = await copyText(media.map(slugOf).join('\n'));
+        if (!ok) { toast('Copy failed. Your browser blocked clipboard access.', { tone: 'error' }); return; }
+        media.forEach(it => { it.copied = true; updateRow(it); });
+        renderSummary();
+        toast(`Copied ${fmt.plural(media.length, 'ID')}, one per line`, { tone: 'success', duration: 2500 });
     });
     cancelAllBtn.addEventListener('click', () => { items.filter(isCancellable).forEach(cancel); });
     clearBtn.addEventListener('click', clearFinished);

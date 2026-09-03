@@ -233,8 +233,7 @@ export function createViewer({ root, contentEl, getPrefix, getFileInfo, fetchPre
                     : `Showing the first ${fmt.bytes(preview.text.length)} of ${fmt.int(preview.total_chars)} characters. Download the file for the rest.`)));
         }
         if (preview.kind === 'table') {
-            const hint = el('p', { class: 'form-hint' }, 'Click a cell to expand it, a column name to sort, or a row number to see the whole row.');
-            b.append(...notices, buildTable(preview), hint);
+            b.append(...notices, buildTable(preview));
         } else {
             tbody = null;
             table = null;
@@ -245,7 +244,27 @@ export function createViewer({ root, contentEl, getPrefix, getFileInfo, fetchPre
         if (find) { find.disabled = false; find.value = ''; }
         root.querySelectorAll('.viewer__tools .btn[disabled]').forEach(x => { x.disabled = false; });
         updateCount();
+        // The page itself does not scroll while the viewer is open; the table
+        // (or code block) takes exactly the viewport that is left and is the one
+        // scroller, so wheel, End/Home and the scrollbar all act on the rows.
+        fitScroller();
+        const s = root.querySelector('.table-scroll, .code');
+        if (s) s.focus({ preventScroll: true });
+        // Fonts or a late-wrapping toolbar can shift the top edge a little after first paint.
+        setTimeout(fitScroller, 250);
     }
+
+    function fitScroller() {
+        const s = root.querySelector('.table-scroll, .code');
+        if (!s) return;
+        // A background or not-yet-laid-out tab reports a tiny viewport; leave the
+        // CSS fallback in place and try again on resize / when it becomes visible.
+        if (window.innerHeight < 200) { s.style.maxHeight = ''; return; }
+        const top = s.getBoundingClientRect().top;
+        s.style.maxHeight = `${Math.max(160, Math.floor(window.innerHeight - top - 12))}px`;
+    }
+    window.addEventListener('resize', () => { if (isOpen()) fitScroller(); });
+    document.addEventListener('visibilitychange', () => { if (isOpen() && document.visibilityState === 'visible') fitScroller(); });
 
     function buildTable(preview) {
         header = preview.header.length ? preview.header.slice() : [];
@@ -304,7 +323,7 @@ export function createViewer({ root, contentEl, getPrefix, getFileInfo, fetchPre
         };
         buildChunk();
 
-        const scroll = el('div', { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-labelledby': 'viewer-title' }, table);
+        const scroll = el('div', { class: 'table-scroll', tabindex: '0', role: 'region', 'aria-labelledby': 'viewer-title', title: 'Click a cell to expand it, a column name to sort, a row number to see the whole row' }, table);
         scroll.addEventListener('click', onTableClick);
         return scroll;
     }

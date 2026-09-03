@@ -475,6 +475,9 @@
   .tray-row__status { display: flex; gap: 6px; font-size: var(--fs-xs); color: var(--text-muted); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tray-row--error .tray-row__status { color: var(--danger-fg); white-space: normal; }
   .tray-row--done .tray-row__status { color: var(--success-fg); }
+  /* Rows whose ID has been copied step back so the ones still to copy stand out. */
+  .tray-row--copied .tray-row__name, .tray-row--copied .tray-row__status { color: var(--text-muted); }
+  .tray-row__copied { height: 18px; padding: 0 6px; }
   .tray-row__actions { display: flex; gap: 4px; }
   .tray-row__bar { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--border); overflow: hidden; }
   .tray-row__bar::after { content: ''; position: absolute; inset: 0; width: calc(var(--pct, 0) * 1%); background: var(--accent); transition: width var(--dur-base) var(--ease); }
@@ -484,6 +487,7 @@
   /* ---- data table (viewer) */
   .table-scroll {
     overflow: auto; overscroll-behavior: contain;
+    /* Fallback; viewer.js sets the exact remaining viewport height inline. */
     max-height: calc(100dvh - var(--h-appbar) - var(--h-viewerbar) - 24px);
     border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface-1);
   }
@@ -563,7 +567,11 @@
   .siterow__end { display: flex; align-items: center; gap: 4px; padding-left: 8px; flex: none; }
 
   /* ---- content */
-  main { padding: 16px 0 96px; }
+  /* Only vertical padding here: the horizontal padding comes from .container. */
+  main { padding-top: 16px; padding-bottom: 96px; }
+  /* While the viewer is open the table (or code block) is the only scroller. */
+  html:has(#viewer:not([hidden])) { overflow: hidden; }
+  main:has(#viewer:not([hidden])) { padding-bottom: 0; }
   #prefix-note { margin-bottom: 16px; }
   .folders { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 16px; font-size: var(--fs-sm); color: var(--text-muted); }
   .folders > span:first-child { display: inline-flex; align-items: center; gap: 4px; }
@@ -654,7 +662,8 @@
   /* Controls that fill a clipping scroller (tab rails, table cells) draw their
      focus ring inside the box; the default 2px offset would be clipped away. */
   .sectionbar .tab:focus-visible, .siterail .tab:focus-visible, .siterail .crumb:focus-visible,
-  .statusrow .chip:focus-visible, .table .rownum:focus-visible { outline-offset: -2px; }
+  .statusrow .chip:focus-visible, .table .rownum:focus-visible,
+  .table-scroll:focus-visible, .code:focus-visible { outline-offset: -2px; }
 
   /* ---- responsive: tablet */
   @media (max-width: 900px) {
