@@ -15,7 +15,7 @@ import zipfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
@@ -24,8 +24,9 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers
 from pydantic import BaseModel, Field, field_validator
 
 load_dotenv()
@@ -2357,18 +2358,112 @@ async def delete_suggestion(suggestion_id: str):
 
 # ---------------- Static ----------------
 
+STATIC_DIR = "static"
+_ASSET_VERSION_TOKEN = b"__ASSET_VERSION__"
+# A compressing proxy (Caddy's encode) appends these to ETags on the way out and
+# browsers echo the suffixed value back in If-None-Match.
+_ETAG_SUFFIXES = ("-gzip", "-br", "-zstd")
+_ASSET_CACHE_IMMUTABLE = "public, max-age=31536000, immutable"
+
+
+def _asset_version() -> str:
+    """Fingerprint of every non-HTML file under static/ (path, size, mtime).
+    Stamped into the HTML as ?v= on script and style URLs so browsers may cache
+    them for a year while a deploy still takes effect on the next page load.
+    It walks a handful of files, so it is recomputed per request; that also
+    keeps local development honest without a restart."""
+    h = hashlib.sha1()
+    for root, _dirs, files in os.walk(STATIC_DIR):
+        for name in sorted(files):
+            if name.endswith(".html"):
+                continue
+            full = os.path.join(root, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, STATIC_DIR).replace(os.sep, "/")
+            h.update(f"{rel}:{st.st_size}:{st.st_mtime_ns};".encode())
+    return h.hexdigest()[:12]
+
+
+def _etag_matches(header_value: str | None, etag: str) -> bool:
+    """Weak If-None-Match comparison that tolerates proxy compression suffixes."""
+    if not header_value:
+        return False
+    bare = etag.strip('"')
+    for tag in header_value.split(","):
+        tag = tag.strip()
+        if tag.startswith("W/"):
+            tag = tag[2:]
+        tag = tag.strip('"')
+        for suffix in _ETAG_SUFFIXES:
+            if tag.endswith(suffix):
+                tag = tag[: -len(suffix)]
+        if tag == bare:
+            return True
+    return False
+
+
 class RevalidatedStaticFiles(StaticFiles):
-    """StaticFiles that makes every cache (browser and CDN edge) revalidate
-    before reuse. Without this, an edge cache like Cloudflare holds .js/.css by
-    file extension but never .html, so a deploy serves new HTML with the last
-    release's script and the UI crashes on DOM lookups that no longer exist.
-    Revalidation is cheap: responses carry ETags, so an unchanged file is a 304."""
+    """StaticFiles with two cache policies.
+
+    HTML, and any asset requested without the current ?v= fingerprint, is
+    served with Cache-Control: no-cache so browsers and CDN edges revalidate
+    before reuse. (Without this an edge cache like Cloudflare held .js/.css by
+    extension but never .html, and a deploy served new HTML with the last
+    release's script.) Revalidation is cheap: responses carry ETags, so an
+    unchanged file is a 304.
+
+    HTML additionally has __ASSET_VERSION__ replaced by the static-file
+    fingerprint, and an asset requested with the matching ?v= is served
+    immutable for a year. Normal page loads then make no asset requests at
+    all, and a deploy changes the fingerprint so the next HTML load pulls the
+    new files.
+    """
 
     async def get_response(self, path: str, scope):
+        if self._is_html_request(path):
+            # Starlette would answer If-None-Match from index.html's own
+            # mtime/size ETag, which ignores the fingerprint substituted into
+            # the body: a JS-only deploy changes the fingerprint but not the
+            # HTML file, and browsers holding the old HTML would get a 304 and
+            # keep the old asset URLs. Judge conditional requests on the
+            # rendered body instead, so hide those headers from Starlette.
+            stripped = dict(scope)
+            stripped["headers"] = [
+                (k, v) for k, v in scope.get("headers", [])
+                if k.lower() not in (b"if-none-match", b"if-modified-since")
+            ]
+            response = await super().get_response(path, stripped)
+            if isinstance(response, FileResponse) and response.path.endswith(".html"):
+                return await asyncio.to_thread(self._render_html, response.path, scope)
+            return response
         response = await super().get_response(path, scope)
-        response.headers["Cache-Control"] = "no-cache"
+        requested = parse_qs(scope.get("query_string", b"").decode("latin-1")).get("v", [""])[0]
+        if requested and response.status_code in (200, 304) and requested == _asset_version():
+            response.headers["Cache-Control"] = _ASSET_CACHE_IMMUTABLE
+        else:
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
+    @staticmethod
+    def _is_html_request(path: str) -> bool:
+        # Starlette hands the site root over as "." and directories without a
+        # suffix; both resolve to index.html, so anything without a file
+        # extension is treated as HTML.
+        return os.path.splitext(path)[1].lower() in ("", ".html")
 
-os.makedirs("static", exist_ok=True)
-app.mount("/", RevalidatedStaticFiles(directory="static", html=True), name="static")
+    @staticmethod
+    def _render_html(file_path: str, scope) -> Response:
+        with open(file_path, "rb") as f:
+            body = f.read().replace(_ASSET_VERSION_TOKEN, _asset_version().encode())
+        etag = f'"{hashlib.md5(body).hexdigest()}"'
+        headers = {"Cache-Control": "no-cache", "ETag": etag}
+        if _etag_matches(Headers(scope=scope).get("if-none-match"), etag):
+            return Response(status_code=304, headers=headers)
+        return Response(body, media_type="text/html", headers=headers)
+
+
+os.makedirs(STATIC_DIR, exist_ok=True)
+app.mount("/", RevalidatedStaticFiles(directory=STATIC_DIR, html=True), name="static")

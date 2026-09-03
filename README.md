@@ -89,6 +89,22 @@ If you want to expose the app to your network, you can use the `--host` flag:
 uvicorn main:app --reload --port 8000 --host 0.0.0.0
 ```
 
+### How the web UI is cached
+
+The two HTML pages are always served with `Cache-Control: no-cache`, so browsers and
+CDN edges revalidate them on every load (a cheap ETag round trip). Every script and
+stylesheet URL in them carries `?v=<fingerprint>`, where the fingerprint is derived
+from the size and modification time of all files under `static/` and substituted for
+`__ASSET_VERSION__` when the HTML is served; an import map gives the modules' own
+relative imports the same suffix. A request whose `?v=` matches the current
+fingerprint is served `immutable` for a year, so a normal page load makes no asset
+requests at all, while a deploy changes the fingerprint and the next HTML load pulls
+the new files. Requests without the current `?v=` fall back to `no-cache`.
+
+If Cloudflare sits in front of the app, a cache rule that bypasses the cache for the
+manager's path keeps every request on the visitor's own edge (see the deployment notes
+in the git history for why); browser caching is unaffected by it.
+
 ## Docker
 
 ### Host Requirements

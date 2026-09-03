@@ -10,7 +10,30 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="style.css">
+    <!-- __ASSET_VERSION__ is replaced by the server with a fingerprint of the static files:
+         URLs carrying it are cached by the browser for a year, and a deploy changes it.
+         The import map gives the modules' own relative imports the same suffix. -->
+    <link rel="stylesheet" href="style.css?v=__ASSET_VERSION__">
+    <script type="importmap">
+    {
+        "imports": {
+            "./js/manager.js": "./js/manager.js?v=__ASSET_VERSION__",
+            "./js/common.js": "./js/common.js?v=__ASSET_VERSION__",
+            "./js/ui.js": "./js/ui.js?v=__ASSET_VERSION__",
+            "./js/shell.js": "./js/shell.js?v=__ASSET_VERSION__",
+            "./js/uploads.js": "./js/uploads.js?v=__ASSET_VERSION__",
+            "./js/viewer.js": "./js/viewer.js?v=__ASSET_VERSION__"
+        }
+    }
+    </script>
+    <!-- Fetch every module up front instead of discovering imports one level at a time
+         (each level is a full round trip to the origin behind the CDN). -->
+    <link rel="modulepreload" href="js/manager.js?v=__ASSET_VERSION__">
+    <link rel="modulepreload" href="js/common.js?v=__ASSET_VERSION__">
+    <link rel="modulepreload" href="js/ui.js?v=__ASSET_VERSION__">
+    <link rel="modulepreload" href="js/shell.js?v=__ASSET_VERSION__">
+    <link rel="modulepreload" href="js/uploads.js?v=__ASSET_VERSION__">
+    <link rel="modulepreload" href="js/viewer.js?v=__ASSET_VERSION__">
     <link rel="icon"
         href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>">
 </head>
@@ -178,7 +201,7 @@
     <input type="file" id="file-input" class="visually-hidden" multiple tabindex="-1" aria-hidden="true">
     <input type="file" id="replace-input" class="visually-hidden" tabindex="-1" aria-hidden="true">
 
-    <script type="module" src="js/manager.js"></script>
+    <script type="module" src="js/manager.js?v=__ASSET_VERSION__"></script>
 </body>
 
 </html>
