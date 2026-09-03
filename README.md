@@ -159,6 +159,11 @@ To build a new image with the latest tag, run
 ```bash
 ./build.sh
 ```
+On Windows use the PowerShell equivalent (same flow: build, list, ask to push):
+```powershell
+.\build.ps1            # add -Push to skip the prompt, -Tag 1.2.3 for a custom tag, -DryRun to preview
+```
+The converter has the same pair of scripts in [webp/](./webp/).
 
 ## Metadata removal
 
@@ -273,6 +278,15 @@ On startup, any suggestion JSON objects still in R2 (legacy `_suggestions/{id}.j
 or `_suggestions/{site}/{status}/...json` layouts) are imported into the database
 and then removed from the bucket.
 
+**Pending uploads view.** The manager's site row ends with a **Pending uploads**
+tab (also linked from the suggestions page) that lists `_suggestions/_pending/`.
+Its media is split into **Not in any suggestion** — uploaded through the public API
+but never attached to a suggestion, i.e. abandoned submissions or abuse — and **In a
+suggestion**, where each tile carries the suggestion id and the preview dialog links
+to it. Captions show the upload age; the filter box matches suggestion ids too.
+Uploads are disabled in this view. The grouping comes from
+`GET /api/suggestions/image-refs`.
+
 ### Performance & benchmark logging
 
 Approving a suggestion copies every pending image's three files (original,
@@ -324,8 +338,22 @@ the link"); `gid` is the tab id from the sheet URL (`.../edit#gid=<gid>`).
 CSV_SOURCES={"dokinomicon":[{"file":"data.csv","id":"<sheet-id>","gid":"0"}]}
 ```
 
-That powers the manager's **Update from spreadsheet** button, which downloads each
-configured tab and overwrites the matching file.
+That powers the manager's **Data files** panel, which is pinned above the media on
+any prefix with sources configured. Each data file row shows its row and column
+count, size and last-modified time, and offers:
+
+- **View** — opens the file in the in-app viewer (a sortable, searchable table for
+  CSV/TSV, plain text for other text files). The viewer reads straight from the
+  bucket through `GET /api/content/preview`, never from the CDN, so what you see is
+  exactly what the sites will fetch next. Row counts skip blank lines and exclude
+  the header row (the scheduled sync's safety check also skips blank lines but
+  counts the header, so its "row count fell from" numbers run one higher).
+- **Open sheet** — opens the Google Sheet tab the file is exported from in a new tab.
+- **Update from spreadsheet** — downloads each configured tab and overwrites the
+  matching file, then reports per file what changed (rows before → after, or
+  "unchanged" when the content is identical) and flags a drop of 50% or more.
+
+Other text files in a prefix (`.json`, `.txt`, `.md`, …) get the same **View** action.
 
 #### Automatic sync
 
@@ -382,10 +410,27 @@ Cloudflare dashboard → **Security → WAF → Rate limiting rules** → Create
 
 ### Admin endpoints (X-API-KEY required)
 
+Content (used by the manager page):
+
+| Method | Path                                          | Purpose                                                  |
+|--------|-----------------------------------------------|----------------------------------------------------------|
+| GET    | `/api/content?prefix=`                        | Grouped listing: `images`, `videos`, `others`, `public_url_prefix`, `common_prefixes`, and `csv_sources` as `[{file, sheet_url}]` for the prefix |
+| GET    | `/api/content/preview?key=`                   | Parsed contents of a text-ish object for the in-app viewer. CSV/TSV → `{kind: "table", header, rows, total_rows, truncated, row_limit, …}` (first 5000 rows); other text → `{kind: "text", text, total_chars, truncated}`. Also `size`, `last_modified`, `etag`, `encoding`. `404` missing, `413` over 8 MB, `415` binary/unsupported, `422` unparseable CSV. Successful responses carry `Cache-Control: no-store`. |
+| POST   | `/api/content/sync-csv?prefix=`               | Re-download the prefix's configured sheet tabs → `{updated, errors}` |
+| POST   | `/api/upload`                                 | multipart `prefix`, `file`, optional `override_filename` |
+| DELETE | `/api/content?key=`                           | Delete one object                                        |
+| POST   | `/api/content/bulk-delete`                    | `{keys}` — delete up to 1000 objects                     |
+| POST   | `/api/content/schedule-delete`                | `{keys, delay_seconds, label, prefix}` — delayed delete  |
+| GET    | `/api/scheduled-deletes?prefix=`              | Pending delayed deletes                                  |
+| DELETE | `/api/scheduled-deletes/{id}`                 | Cancel a delayed delete                                  |
+
+Suggestions:
+
 | Method | Path                                                       | Purpose                                                  |
 |--------|------------------------------------------------------------|----------------------------------------------------------|
 | GET    | `/api/suggestions?site=&status=&limit=`                    | List newest-first (filters optional; `limit` default 200, max 1000). Returns `{suggestions, total, truncated}` |
 | GET    | `/api/suggestions/counts`                                  | `{site: {pending, approved, rejected, completed}}` for tabs |
+| GET    | `/api/suggestions/image-refs`                              | `{image_id: [{suggestion_id, site, status, image_status, moved_to, submitted_at}]}` for every image any suggestion mentions (drives the pending-uploads grouping) |
 | GET    | `/api/suggestions/{id}`                                    | Get single suggestion                                    |
 | GET    | `/api/suggestions/{id}/images.zip`                         | All the suggestion's original image files as one zip, each entry named `{image_id}{ext}`. Missing files are skipped and listed in the `X-Skipped-Images` header. |
 | PATCH  | `/api/suggestions/{id}`                                    | Edit `payload` / `kind` / `site` (only while pending). `admin_context` (feedback shown to the suggester) and `summary` are editable at any time. |

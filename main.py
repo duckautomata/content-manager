@@ -15,13 +15,14 @@ import zipfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 import httpx
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -82,6 +83,12 @@ def _load_csv_sources() -> dict:
         if cleaned:
             sources[key] = cleaned
     return sources
+
+
+def _sheet_url(entry: dict) -> str:
+    """Browser URL of the Google Sheet tab a CSV source is exported from, for the
+    manager's "Open sheet" button."""
+    return f"https://docs.google.com/spreadsheets/d/{entry['id']}/edit#gid={entry['gid']}"
 
 
 # Prefix -> list of Google Sheet CSV sources for the "Update from spreadsheet" button.
@@ -796,6 +803,40 @@ def _count_suggestions_sync() -> dict[str, dict[str, int]]:
     return counts
 
 
+def _image_refs_sync() -> dict[str, list[dict]]:
+    """Map every image id any suggestion mentions to the suggestions referencing
+    it, newest first. The manager's pending-uploads view uses this to separate
+    visitor uploads that belong to a suggestion from ones that never got one."""
+    conn = _db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, site, status, images, submitted_at FROM suggestions ORDER BY submitted_at DESC"
+        ).fetchall()
+    finally:
+        conn.close()
+    refs: dict[str, list[dict]] = {}
+    for row in rows:
+        try:
+            images = json.loads(row["images"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(images, list):
+            continue
+        for img in images:
+            img_id = img.get("id") if isinstance(img, dict) else None
+            if not img_id:
+                continue
+            refs.setdefault(img_id, []).append({
+                "suggestion_id": row["id"],
+                "site": row["site"],
+                "status": row["status"],
+                "image_status": img.get("status"),
+                "moved_to": img.get("moved_to"),
+                "submitted_at": row["submitted_at"],
+            })
+    return refs
+
+
 def _list_suggestions_sync(
     site: str | None, status: str | None, limit: int
 ) -> tuple[list[dict], int]:
@@ -1042,7 +1083,7 @@ async def _notify_discord(suggestion: dict, sample_image_url: str | None) -> Non
     if len(payload_str) > 900:
         payload_str = payload_str[:900] + "\n... (truncated)"
     review_url = (
-        f"{ADMIN_URL.rstrip('/')}/suggestions.html?id={sid}" if ADMIN_URL else None
+        f"{ADMIN_URL.rstrip('/')}/suggestions.html?site={quote(site)}&id={sid}" if ADMIN_URL else None
     )
 
     embed: dict = {
@@ -1174,8 +1215,20 @@ async def get_content(prefix: str):
     images_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     videos_list.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
     final_others.sort(key=lambda x: x.get("last_modified", ""), reverse=True)
-    csv_sources = [e["file"] for e in CSV_SOURCES.get(prefix.rstrip("/") + "/", [])]
-    return {"images": images_list, "videos": videos_list, "others": final_others, "public_url_prefix": PUBLIC_URL_PREFIX, "common_prefixes": COMMON_PREFIXES, "csv_sources": csv_sources}
+    csv_sources = [
+        {"file": e["file"], "sheet_url": _sheet_url(e)}
+        for e in CSV_SOURCES.get(prefix.rstrip("/") + "/", [])
+    ]
+    return {
+        "images": images_list,
+        "videos": videos_list,
+        "others": final_others,
+        "public_url_prefix": PUBLIC_URL_PREFIX,
+        "common_prefixes": COMMON_PREFIXES,
+        "csv_sources": csv_sources,
+        # Where the public API parks visitor uploads; the manager offers it as a view.
+        "pending_prefix": PENDING_PREFIX,
+    }
 
 
 @app.post("/api/upload", dependencies=[Depends(require_api_key)])
@@ -1487,6 +1540,149 @@ async def sync_csv(prefix: str):
     if errors and not updated:
         raise HTTPException(status_code=502, detail="; ".join(f"{x['file']}: {x['error']}" for x in errors))
     return {"status": "success", "updated": updated, "errors": errors}
+
+
+# ---------------- File preview ----------------
+
+# In-app viewer for the text-ish files in a prefix — the CSV data files above
+# all. Reads straight from the bucket so what the admin sees is exactly what the
+# sites will fetch, never a stale CDN copy.
+PREVIEW_MAX_BYTES = 8 * 1024 * 1024
+PREVIEW_ROW_LIMIT = 5000
+# Python's csv module refuses fields over 128 KiB by default; a preview body is
+# at most PREVIEW_MAX_BYTES, so no field it could contain needs refusing.
+csv.field_size_limit(PREVIEW_MAX_BYTES)
+PREVIEW_TEXT_CHARS = 512 * 1024
+_PREVIEW_TABLE_DELIMITERS = {".csv": ",", ".tsv": "\t"}
+_PREVIEW_TEXT_EXTENSIONS = frozenset({
+    ".txt", ".text", ".md", ".markdown", ".json", ".jsonl", ".ndjson", ".xml", ".yaml", ".yml",
+    ".html", ".htm", ".css", ".js", ".mjs", ".ts", ".ini", ".cfg", ".toml", ".log", ".svg",
+    ".py", ".sh", ".env", ".csv", ".tsv",
+})
+_PREVIEW_TEXT_MIMES = frozenset({
+    "application/json", "application/xml", "application/x-yaml", "application/yaml",
+    "application/javascript", "application/x-ndjson", "image/svg+xml",
+})
+
+
+def _read_object_for_preview_sync(key: str) -> tuple[bytes, dict]:
+    """Fetch an object's bytes plus the metadata the viewer shows. Oversized
+    objects are refused before their body is read."""
+    try:
+        obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+    except ClientError as ex:
+        code = ex.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            raise HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=502, detail=f"Could not read file: {code or ex}")
+    except Exception as ex:
+        # Endpoint unreachable, connect/read timeout: botocore errors, not ClientError.
+        raise HTTPException(status_code=502, detail=f"Could not read file: {ex}")
+    size = int(obj.get("ContentLength") or 0)
+    if size > PREVIEW_MAX_BYTES:
+        obj["Body"].close()
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"File is {size / (1024 * 1024):.1f} MB; previews are capped at "
+                f"{PREVIEW_MAX_BYTES // (1024 * 1024)} MB. Download it instead."
+            ),
+        )
+    try:
+        body = obj["Body"].read()
+    except Exception as ex:
+        raise HTTPException(status_code=502, detail=f"Could not read file: {ex}")
+    last_modified = obj.get("LastModified")
+    return body, {
+        "size": len(body),
+        "last_modified": last_modified.isoformat() if last_modified else None,
+        "etag": (obj.get("ETag") or "").strip('"'),
+        "content_type": obj.get("ContentType") or "",
+    }
+
+
+def _decode_preview_text(body: bytes) -> tuple[str, str]:
+    """Decode bytes for display. Returns (text, encoding note). A file that is
+    not clean UTF-8 is shown with replacement characters rather than refused,
+    since seeing a mangled cell is more useful than seeing nothing."""
+    if body[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        # UTF-16 with a BOM (PowerShell redirection, Excel "Unicode Text"): every
+        # ASCII character carries a NUL, so it must be handled before the sniff.
+        try:
+            return body.decode("utf-16"), "utf-16"
+        except UnicodeDecodeError:
+            return body.decode("utf-16", errors="replace"), "utf-16 (invalid bytes replaced)"
+    if b"\x00" in body[:8192]:
+        raise HTTPException(status_code=415, detail="This looks like a binary file; there is nothing to preview")
+    try:
+        return body.decode("utf-8-sig"), "utf-8"
+    except UnicodeDecodeError:
+        return body.decode("utf-8-sig", errors="replace"), "utf-8 (invalid bytes replaced)"
+
+
+@app.get("/api/content/preview", dependencies=[Depends(require_api_key)])
+async def preview_content(key: str, response: Response):
+    """Parsed contents of a text-ish object for the in-app viewer. CSV/TSV come
+    back as header + rows (parsed server-side, so quoted commas and embedded
+    newlines are handled); other text files come back as a string. Both are
+    capped, with the full size reported so the UI can say so."""
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+    key = key.strip()
+    if not key or key.endswith("/"):
+        raise HTTPException(status_code=400, detail="key must name a file")
+    # The whole point of this endpoint is freshness: never let a cache answer it.
+    response.headers["Cache-Control"] = "no-store"
+
+    filename = key.rsplit("/", 1)[-1]
+    stem, ext = os.path.splitext(filename)
+    if not ext and stem.startswith("."):
+        ext = stem  # a dotfile such as ".env": the whole name is the extension, as the UI sees it
+    ext = ext.lower()
+    body, meta = await asyncio.to_thread(_read_object_for_preview_sync, key)
+    ctype = meta["content_type"].split(";")[0].strip().lower()
+
+    delimiter = _PREVIEW_TABLE_DELIMITERS.get(ext)
+    if delimiter is None and ctype == "text/csv":
+        delimiter = ","
+    elif delimiter is None and ctype == "text/tab-separated-values":
+        delimiter = "\t"
+    is_text = ext in _PREVIEW_TEXT_EXTENSIONS or ctype.startswith("text/") or ctype in _PREVIEW_TEXT_MIMES
+    if delimiter is None and not is_text:
+        raise HTTPException(status_code=415, detail=f"No preview for {ext + ' files' if ext else 'this kind of file'}")
+
+    text, encoding = _decode_preview_text(body)
+    common = {"key": key, "filename": filename, "encoding": encoding, **meta}
+
+    if delimiter is not None:
+        try:
+            rows = [
+                row
+                for row in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+                if any(c.strip() for c in row)
+            ]
+        except csv.Error as ex:
+            raise HTTPException(status_code=422, detail=f"Could not parse as CSV: {ex}")
+        header = rows[0] if rows else []
+        data = rows[1:]
+        return {
+            **common,
+            "kind": "table",
+            "delimiter": delimiter,
+            "header": header,
+            "rows": data[:PREVIEW_ROW_LIMIT],
+            "total_rows": len(data),
+            "truncated": len(data) > PREVIEW_ROW_LIMIT,
+            "row_limit": PREVIEW_ROW_LIMIT,
+        }
+
+    return {
+        **common,
+        "kind": "text",
+        "text": text[:PREVIEW_TEXT_CHARS],
+        "total_chars": len(text),
+        "truncated": len(text) > PREVIEW_TEXT_CHARS,
+    }
 
 
 @app.delete("/api/content", dependencies=[Depends(require_api_key)])
@@ -1911,6 +2107,14 @@ async def suggestion_counts():
     for site in ALLOWED_SITES:
         counts.setdefault(site, {st: 0 for st in _SUGGESTION_STATUSES})
     return counts
+
+
+@app.get("/api/suggestions/image-refs", dependencies=[Depends(require_api_key)])
+async def suggestion_image_refs():
+    """{image_id: [{suggestion_id, site, status, image_status, moved_to, submitted_at}, ...]}
+    for every image mentioned by any suggestion. Declared before the
+    /{suggestion_id} route so the literal path wins."""
+    return await asyncio.to_thread(_image_refs_sync)
 
 
 @app.get("/api/suggestions/{suggestion_id}", dependencies=[Depends(require_api_key)])
