@@ -51,7 +51,7 @@ ALLOWED_SITES = [s.strip() for s in os.environ.get("ALLOWED_SITES", "").split(",
 # normalized to end with a single "/".
 COMMON_PREFIXES = [
     p.strip().rstrip("/") + "/"
-    for p in os.environ.get("COMMON_PREFIXES", "home,dokimotes,dokinomicon,dokimosaic").split(",")
+    for p in os.environ.get("COMMON_PREFIXES", "home,dokimotes,dokinomicon,dokimosaic,mintomotes,mintonomicon").split(",")
     if p.strip()
 ]
 

@@ -512,6 +512,9 @@ function fillContainer(container, items, make) {
     step();
 }
 
+// Emote prefixes, whose transparent images get a checkerboard behind them.
+const ALPHA_PREFIXES = ['dokimotes/', 'mintomotes/'];
+
 function makeTile(item, kind) {
     const thumbKey = item.files.thumbnail || item.files.preview || item.files.original;
     const src = urlFor(keyOf(thumbKey)) || FALLBACK_IMG;
@@ -521,7 +524,7 @@ function makeTile(item, kind) {
     const refIds = pending ? (state.imageRefs.get(item.slug) || []).map(r => r.suggestion_id) : [];
     const refLabel = pending ? (refIds.length ? `, in suggestion ${refIds.join(', ')}` : ', not in any suggestion') : '';
     const tile = el('div', {
-        class: `tile${kind === 'video' ? ' tile--video' : ''}${state.prefix === 'dokimotes/' ? ' tile--alpha' : ''}${sched ? ' tile--scheduled' : ''}`,
+        class: `tile${kind === 'video' ? ' tile--video' : ''}${ALPHA_PREFIXES.includes(state.prefix) ? ' tile--alpha' : ''}${sched ? ' tile--scheduled' : ''}`,
         dataset: { id: item.slug, q: [item.slug, ...refIds].join(' ').toLowerCase() },
     });
     tile.append(el('button', {
