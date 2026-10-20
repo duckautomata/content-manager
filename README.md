@@ -159,12 +159,13 @@ optional:
 | `MAX_ANIM_FRAMES`  | `300`          | Frames kept from an APNG / animated AVIF; the rest are cut.  |
 | `MAX_ANIM_PIXELS`  | `50000000`     | Pixel budget across all frames of one such animation.        |
 
-The content manager mirrors both caps as `CONVERSION_MAX_UPLOAD_MB` and
-`CONVERSION_MAX_VIDEO_UPLOAD_MB` (same defaults; compose sets all four side by side)
-and refuses media over the matching cap with a `413` before calling the converter.
-Without that check the converter's own `413` never arrives: it closes the socket once
-the cap is hit while the upload is still in flight, and the app only sees a dropped
-connection.
+The content manager reads both caps from `GET /formats` at startup and refuses media
+over the matching cap with a `413` before calling the converter. Without that check
+the converter's own `413` never arrives: it closes the socket once the cap is hit
+while the upload is still in flight, and the app only sees a dropped connection.
+`CONVERSION_MAX_UPLOAD_MB` and `CONVERSION_MAX_VIDEO_UPLOAD_MB` (same defaults) are
+the fallback for a converter that cannot be reached at startup or is an older build
+that does not report its caps.
 
 ### Converter endpoints
 
@@ -176,7 +177,7 @@ connection.
 | POST   | `/strip`                 | The same file with its metadata removed (see below)                              |
 | POST   | `/bulk?height=N`         | Zip of images in, zip of WebPs out                                               |
 | GET    | `/slug?name=`            | Slug and short uuid for a name                                                   |
-| GET    | `/formats`               | Accepted input extensions                                                        |
+| GET    | `/formats`               | Accepted input extensions and the upload caps (`max_upload_mb`, `max_video_upload_mb`) |
 
 ### Building new image
 To build a new image with the latest tag, run

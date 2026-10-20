@@ -547,7 +547,8 @@ func handleSlug(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// GET /formats - List supported input file extensions
+// GET /formats - List supported input file extensions and the upload caps, so
+// the content manager can refuse oversized media before sending it.
 func handleFormats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -559,7 +560,11 @@ func handleFormats(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Strings(formats)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"formats": formats})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"formats":             formats,
+		"max_upload_mb":       maxUploadBytes / (1024 * 1024),
+		"max_video_upload_mb": maxVideoUploadBytes / (1024 * 1024),
+	})
 }
 
 // ---------------- Helpers ----------------

@@ -43,10 +43,12 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 S3_CONFIGURED = all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME])
 CONVERSION_SERVICE_URL = os.environ.get("CONVERSION_SERVICE_URL", "http://webp-converter:8090")
-# The converter's upload caps (its MAX_UPLOAD_MB and MAX_VIDEO_UPLOAD_MB; compose sets
-# all four). Media over its cap is refused here with a clear 413. Sending it anyway
-# would not produce one: the converter answers 413 once the cap is hit and closes the
-# socket while the rest is still in flight, so all this side sees is a reset connection.
+# The converter's upload caps. At startup the app reads the live values from the
+# converter's /formats response; these settings are the fallback for when it cannot
+# be reached or is an older build that does not report them. Media over the cap is
+# refused here with a clear 413. Sending it anyway would not produce one: the
+# converter answers 413 once the cap is hit and closes the socket while the rest is
+# still in flight, so all this side sees is a reset connection.
 CONVERSION_MAX_UPLOAD_MB = int(os.environ.get("CONVERSION_MAX_UPLOAD_MB", "25"))
 CONVERSION_MAX_VIDEO_UPLOAD_MB = int(os.environ.get("CONVERSION_MAX_VIDEO_UPLOAD_MB", "500"))
 PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")
@@ -181,19 +183,61 @@ if not TURNSTILE_ENABLED:
 
 # ---------------- Lifespan ----------------
 
+async def _load_converter_settings(attempts: int = 5, delay: float = 2.0) -> None:
+    """Ask the converter what it accepts: its input formats and its upload caps.
+    The caps replace CONVERSION_MAX_UPLOAD_MB / CONVERSION_MAX_VIDEO_UPLOAD_MB, which
+    then only matter when the converter cannot be reached or is an older build that
+    does not report them. Compose starts both containers at once, so a converter
+    that is not up yet is retried a few times before giving up."""
+    global SUPPORTED_FORMATS, CONVERSION_MAX_UPLOAD_MB, CONVERSION_MAX_VIDEO_UPLOAD_MB
+    info = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{CONVERSION_SERVICE_URL}/formats", timeout=5)
+                resp.raise_for_status()
+                info = resp.json()
+            break
+        except Exception as e:
+            # An HTTP error means the converter is up and answered; retrying
+            # would not change its mind.
+            if attempt == attempts or isinstance(e, httpx.HTTPStatusError):
+                logger.warning(
+                    "Could not fetch /formats from conversion service (%s); using the fallback "
+                    "format list and upload caps of %d MB (images) / %d MB (video)",
+                    _describe_converter_error(e), CONVERSION_MAX_UPLOAD_MB, CONVERSION_MAX_VIDEO_UPLOAD_MB,
+                )
+                return
+            await asyncio.sleep(delay)
+
+    formats = frozenset(f.lower() for f in info.get("formats", []))
+    if formats:
+        SUPPORTED_FORMATS = formats
+        logger.info("Loaded %d supported formats from conversion service", len(formats))
+
+    caps = {}
+    for key in ("max_upload_mb", "max_video_upload_mb"):
+        value = info.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            caps[key] = value
+    CONVERSION_MAX_UPLOAD_MB = caps.get("max_upload_mb", CONVERSION_MAX_UPLOAD_MB)
+    CONVERSION_MAX_VIDEO_UPLOAD_MB = caps.get("max_video_upload_mb", CONVERSION_MAX_VIDEO_UPLOAD_MB)
+    if caps:
+        logger.info(
+            "Conversion service caps uploads at %d MB (images) / %d MB (video)",
+            CONVERSION_MAX_UPLOAD_MB, CONVERSION_MAX_VIDEO_UPLOAD_MB,
+        )
+    else:
+        logger.info(
+            "Conversion service did not report upload caps; using %d MB (images) / "
+            "%d MB (video) from settings",
+            CONVERSION_MAX_UPLOAD_MB, CONVERSION_MAX_VIDEO_UPLOAD_MB,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global SUPPORTED_FORMATS
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{CONVERSION_SERVICE_URL}/formats", timeout=5)
-            resp.raise_for_status()
-            formats = frozenset(f.lower() for f in resp.json().get("formats", []))
-            if formats:
-                SUPPORTED_FORMATS = formats
-                logger.info("Loaded %d supported formats from conversion service", len(formats))
-    except Exception:
-        logger.warning("Could not fetch /formats from conversion service; using fallback list")
+    await _load_converter_settings()
 
     if S3_CONFIGURED:
         try:
@@ -427,8 +471,8 @@ def _describe_converter_error(exc: BaseException) -> str:
     if isinstance(exc, (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)):
         hint = (
             "the conversion service closed the connection before replying; an upload "
-            "over its MAX_UPLOAD_MB (MAX_VIDEO_UPLOAD_MB for video) does this, so check "
-            "they match CONVERSION_MAX_UPLOAD_MB / CONVERSION_MAX_VIDEO_UPLOAD_MB here"
+            "over its MAX_UPLOAD_MB (MAX_VIDEO_UPLOAD_MB for video) does this. The app "
+            "reads those caps at startup, so restart it if the converter's changed"
         )
         return f"{hint} ({text})" if text else hint
     return text or type(exc).__name__
