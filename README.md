@@ -150,13 +150,21 @@ optional:
 | Variable           | Default        | Purpose                                                      |
 |--------------------|----------------|--------------------------------------------------------------|
 | `PORT`             | `8080`         | Port the server listens on (compose sets `8090`).            |
-| `MAX_UPLOAD_MB`    | `25`           | Max size of a single upload; larger requests get `413`.      |
+| `MAX_UPLOAD_MB`    | `25`           | Max image upload; bounds how long one WebP encode can run. Larger requests get `413`. |
+| `MAX_VIDEO_UPLOAD_MB` | `500`       | Max upload sent with a `video/*` Content-Type; only a frame is extracted, so this guards memory. |
 | `WEBP_QUALITY`     | `75`           | WebP output quality (1–100).                                 |
 | `WEBP_EFFORT`      | `4`            | WebP compression effort (0–6; higher = smaller but slower).  |
 | `MAX_CONCURRENCY`  | CPU core count | Max simultaneous conversions (protects small hosts).         |
 | `VIPS_CONCURRENCY` | `0`            | libvips threads per operation (`0` = libvips default).       |
 | `MAX_ANIM_FRAMES`  | `300`          | Frames kept from an APNG / animated AVIF; the rest are cut.  |
 | `MAX_ANIM_PIXELS`  | `50000000`     | Pixel budget across all frames of one such animation.        |
+
+The content manager mirrors both caps as `CONVERSION_MAX_UPLOAD_MB` and
+`CONVERSION_MAX_VIDEO_UPLOAD_MB` (same defaults; compose sets all four side by side)
+and refuses media over the matching cap with a `413` before calling the converter.
+Without that check the converter's own `413` never arrives: it closes the socket once
+the cap is hit while the upload is still in flight, and the app only sees a dropped
+connection.
 
 ### Converter endpoints
 

@@ -45,16 +45,22 @@ const (
 )
 
 var (
-	maxUploadBytes int64         = 25 * 1024 * 1024 // override via MAX_UPLOAD_MB
-	webpQuality                  = 75               // override via WEBP_QUALITY (1-100)
-	webpEffort                   = 4                // override via WEBP_EFFORT (0-6)
-	convertSem     chan struct{}                    // caps concurrent heavy conversions
+	maxUploadBytes      int64         = 25 * 1024 * 1024  // override via MAX_UPLOAD_MB
+	maxVideoUploadBytes int64         = 500 * 1024 * 1024 // override via MAX_VIDEO_UPLOAD_MB
+	webpQuality                       = 75                // override via WEBP_QUALITY (1-100)
+	webpEffort                        = 4                 // override via WEBP_EFFORT (0-6)
+	convertSem          chan struct{}                     // caps concurrent heavy conversions
 )
 
 func loadConfig() {
 	if v := os.Getenv("MAX_UPLOAD_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			maxUploadBytes = int64(n) * 1024 * 1024
+		}
+	}
+	if v := os.Getenv("MAX_VIDEO_UPLOAD_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxVideoUploadBytes = int64(n) * 1024 * 1024
 		}
 	}
 	if v := os.Getenv("WEBP_QUALITY"); v != "" {
@@ -84,8 +90,8 @@ func loadConfig() {
 		}
 	}
 	convertSem = make(chan struct{}, concurrency)
-	log.Printf("config: maxUpload=%dMB webpQuality=%d webpEffort=%d maxConcurrency=%d maxAnimFrames=%d maxAnimPixels=%d",
-		maxUploadBytes/(1024*1024), webpQuality, webpEffort, concurrency, maxAnimationFrames, maxFilmstripPixels)
+	log.Printf("config: maxUpload=%dMB maxVideoUpload=%dMB webpQuality=%d webpEffort=%d maxConcurrency=%d maxAnimFrames=%d maxAnimPixels=%d",
+		maxUploadBytes/(1024*1024), maxVideoUploadBytes/(1024*1024), webpQuality, webpEffort, concurrency, maxAnimationFrames, maxFilmstripPixels)
 }
 
 func main() {
@@ -558,18 +564,33 @@ func handleFormats(w http.ResponseWriter, r *http.Request) {
 
 // ---------------- Helpers ----------------
 
-// readLimitedBody reads the request body up to maxUploadBytes, writing the
-// appropriate error response (413/400) and returning ok=false on failure.
+// readLimitedBody reads the request body up to the upload cap for its declared
+// type, writing the appropriate error response (413/400) and returning ok=false
+// on failure. MAX_UPLOAD_MB exists to bound how long a full WebP encode can run,
+// which a huge still image stretches to minutes. A video only has its first
+// frame extracted, so a body declared video/* gets the separate, larger
+// MAX_VIDEO_UPLOAD_MB; that one guards memory, since the body is held in full.
 func readLimitedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	limit := maxUploadBytes
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "video/") {
+		limit = maxVideoUploadBytes
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	buf, err := io.ReadAll(r.Body)
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
-			http.Error(w, fmt.Sprintf("Payload too large (max %d MB)", maxUploadBytes/(1024*1024)), http.StatusRequestEntityTooLarge)
+			http.Error(w, fmt.Sprintf("Payload too large (max %d MB)", limit/(1024*1024)), http.StatusRequestEntityTooLarge)
 		} else {
 			http.Error(w, "Failed to read body", http.StatusBadRequest)
 		}
+		return nil, false
+	}
+	if limit != maxUploadBytes && int64(len(buf)) > maxUploadBytes && !looksLikeVideo(buf, "") {
+		// Declared video/* but the bytes are not a video container. A still
+		// image this size would take the full encode the image cap exists to
+		// prevent, so hold it to that cap.
+		http.Error(w, fmt.Sprintf("Payload too large for a non-video body (max %d MB)", maxUploadBytes/(1024*1024)), http.StatusRequestEntityTooLarge)
 		return nil, false
 	}
 	return buf, true

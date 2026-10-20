@@ -43,6 +43,12 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
 S3_CONFIGURED = all([R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME])
 CONVERSION_SERVICE_URL = os.environ.get("CONVERSION_SERVICE_URL", "http://webp-converter:8090")
+# The converter's upload caps (its MAX_UPLOAD_MB and MAX_VIDEO_UPLOAD_MB; compose sets
+# all four). Media over its cap is refused here with a clear 413. Sending it anyway
+# would not produce one: the converter answers 413 once the cap is hit and closes the
+# socket while the rest is still in flight, so all this side sees is a reset connection.
+CONVERSION_MAX_UPLOAD_MB = int(os.environ.get("CONVERSION_MAX_UPLOAD_MB", "25"))
+CONVERSION_MAX_VIDEO_UPLOAD_MB = int(os.environ.get("CONVERSION_MAX_VIDEO_UPLOAD_MB", "500"))
 PUBLIC_URL_PREFIX = os.environ.get("PUBLIC_URL_PREFIX", "")
 API_KEY = os.environ.get("API_KEY")
 
@@ -392,6 +398,42 @@ def _resolve_mime(file_name: str, declared: str | None) -> str:
     return mimetypes.guess_type(file_name)[0] or declared or "application/octet-stream"
 
 
+def _conversion_cap_bytes(mime: str) -> int:
+    """The converter's upload cap for a body, by the Content-Type it is sent with:
+    a video only has its first frame extracted, so it gets the larger cap; a
+    still image is bounded by how long a full WebP encode can run."""
+    mb = CONVERSION_MAX_VIDEO_UPLOAD_MB if mime.startswith("video/") else CONVERSION_MAX_UPLOAD_MB
+    return mb * 1024 * 1024
+
+
+def _media_too_large(size: int, mime: str) -> HTTPException:
+    video = mime.startswith("video/")
+    return HTTPException(
+        status_code=413,
+        detail=(
+            f"File is {size / (1024 * 1024):.1f} MB; {'video' if video else 'image'} uploads "
+            f"are capped at {_conversion_cap_bytes(mime) // (1024 * 1024)} MB (the conversion "
+            f"service's {'MAX_VIDEO_UPLOAD_MB' if video else 'MAX_UPLOAD_MB'})."
+        ),
+    )
+
+
+def _describe_converter_error(exc: BaseException) -> str:
+    """Put words to a failed call to the conversion service. httpx transport
+    errors often stringify to nothing (a socket reset mid-upload surfaces as an
+    empty anyio.BrokenResourceError), which used to reach the UI as
+    "Conversion failed: "."""
+    text = str(exc).strip()
+    if isinstance(exc, (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)):
+        hint = (
+            "the conversion service closed the connection before replying; an upload "
+            "over its MAX_UPLOAD_MB (MAX_VIDEO_UPLOAD_MB for video) does this, so check "
+            "they match CONVERSION_MAX_UPLOAD_MB / CONVERSION_MAX_VIDEO_UPLOAD_MB here"
+        )
+        return f"{hint} ({text})" if text else hint
+    return text or type(exc).__name__
+
+
 async def _convert_and_store(
     *, content: bytes, mime: str, original_ext: str, original_name: str, prefix: str
 ) -> dict:
@@ -399,6 +441,8 @@ async def _convert_and_store(
     Preview and thumbnail are converted concurrently, and the three uploads run
     concurrently. Rolls back partial uploads on failure. Returns slug, ext, and
     the three keys."""
+    if len(content) > _conversion_cap_bytes(mime):
+        raise _media_too_large(len(content), mime)
     bench = _Benchmark("convert+store")
     async with httpx.AsyncClient() as client:
         try:
@@ -410,7 +454,9 @@ async def _convert_and_store(
                 short_uuid = slug_resp.json()["short_uuid"]
         except Exception as e:
             logger.exception("Failed to get slug from conversion service")
-            raise HTTPException(status_code=500, detail=f"Failed to get slug: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"Failed to get slug: {_describe_converter_error(e)}"
+            )
 
         original_key = f"{prefix}{short_uuid}{original_ext}"
         preview_key = f"{prefix}{short_uuid}_p.webp"
@@ -448,13 +494,20 @@ async def _convert_and_store(
 
         def _conversion_content(resp, what: str) -> bytes:
             if isinstance(resp, BaseException):
-                logger.error("%s failed: %s", what, resp)
-                raise HTTPException(status_code=500, detail=f"{what}: {resp}")
-            try:
-                resp.raise_for_status()
-            except Exception as e:
-                logger.exception("%s returned an error", what)
-                raise HTTPException(status_code=500, detail=f"{what}: {e}")
+                reason = _describe_converter_error(resp)
+                logger.error("%s: %s", what, reason)
+                raise HTTPException(status_code=500, detail=f"{what}: {reason}")
+            if resp.is_error:
+                # The converter's error bodies are short plain-text reasons
+                # ("Payload too large (max 25 MB)", "Failed to load image").
+                body = resp.text.strip()
+                reason = f"conversion service returned {resp.status_code}"
+                if body:
+                    reason += f": {body[:300]}"
+                logger.error("%s: %s", what, reason)
+                # Its 413 is a size problem the uploader can act on, not a server fault.
+                status = 413 if resp.status_code == 413 else 500
+                raise HTTPException(status_code=status, detail=f"{what}: {reason}")
             return resp.content
 
         preview_content = _conversion_content(preview_resp, "Conversion failed")
@@ -1238,13 +1291,19 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
         if not S3_CONFIGURED:
             raise HTTPException(status_code=500, detail="S3 client not configured")
 
-        content = await file.read()
         file_name = file.filename or "default-filename"
         mime_type = _resolve_mime(file_name, file.content_type)
         original_ext = os.path.splitext(file_name)[1]
 
         is_image = mime_type.startswith("image/")
         is_video = mime_type.startswith("video/") or original_ext.lower() in [".mp4", ".mov", ".webm", ".mkv", ".avi"]
+
+        # Media goes through the converter, which has a hard upload cap; refuse
+        # it before reading the whole file into memory. Other files go straight
+        # to the bucket and are not capped here.
+        if (is_image or is_video) and file.size is not None and file.size > _conversion_cap_bytes(mime_type):
+            raise _media_too_large(file.size, mime_type)
+        content = await file.read()
 
         if not (is_image or is_video):
             target_filename = override_filename if override_filename else file.filename

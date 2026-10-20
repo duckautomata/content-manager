@@ -5,6 +5,11 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Mirror the converter's caps below so oversized media is refused here with
+      # a clear 413 instead of being sent to a converter that drops the connection.
+      - CONVERSION_MAX_UPLOAD_MB=25
+      - CONVERSION_MAX_VIDEO_UPLOAD_MB=500
     volumes:
       # Local application database (SQLite): suggestions, pending scheduled
       # deletions, and background-job state. Keep this mounted or they are lost
@@ -21,7 +26,9 @@ services:
     environment:
       - PORT=8090
       # Optional tuning — values below are the defaults; edit to override.
-      - MAX_UPLOAD_MB=25       # max size of a single upload (matches the app's public cap)
+      # Both upload caps must match CONVERSION_MAX_*_UPLOAD_MB on content-manager above.
+      - MAX_UPLOAD_MB=25        # max image upload; bounds how long one WebP encode can run
+      - MAX_VIDEO_UPLOAD_MB=500 # max video upload; only a frame is extracted, so this guards memory
       - WEBP_QUALITY=75        # output quality, 1-100
       - WEBP_EFFORT=4          # compression effort, 0-6 (higher = smaller + slower)
       # - MAX_ANIM_FRAMES=300  # frames kept from an animation libvips cannot decode (APNG, animated AVIF)
