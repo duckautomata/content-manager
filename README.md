@@ -245,10 +245,16 @@ All public endpoints require a Cloudflare Turnstile token. CORS is restricted to
 
 | Method | Path                            | Body / Query                                                           | Returns                                          |
 |--------|---------------------------------|------------------------------------------------------------------------|--------------------------------------------------|
-| GET    | `/api/public/config`            | —                                                                      | `{turnstile_site_key, allowed_sites, max_image_bytes, supported_formats, public_url_prefix, pending_prefix}` |
+| GET    | `/api/public/config`            | —                                                                      | `{turnstile_enabled, turnstile_site_key, allowed_sites, max_image_bytes, max_video_bytes, supported_formats, public_url_prefix, pending_prefix}` |
 | POST   | `/api/public/image`             | multipart: `cf_turnstile_response`, `file`                             | `{id, ext, urls: {original, preview, thumbnail}}` |
 | POST   | `/api/public/suggestion`        | json: `{cf_turnstile_response, site, kind, payload, image_ids, summary}` | `{id}` (201)                               |
 | GET    | `/api/public/suggestions/{site}` | query: `ids=sug_a,sug_b` (comma-separated, max 50)                    | `{suggestions: [{id, site, kind, status, summary, submitted_at, updated_at, admin_context}], not_found: [...]}` |
+
+`max_image_bytes` and `max_video_bytes` are the converter's `MAX_UPLOAD_MB` and
+`MAX_VIDEO_UPLOAD_MB` in bytes, as read at startup (see
+[Image converter configuration](#image-converter-configuration)). `/api/public/image`
+refuses anything over the cap for its media type with a `413`, so a suggester site
+should check a file against the cap matching its type before uploading it.
 
 The status-lookup endpoint needs no Turnstile token or auth: suggestion ids are
 unguessable tokens handed out only at submission time, so knowing an id is the

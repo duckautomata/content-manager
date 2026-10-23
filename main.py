@@ -142,7 +142,6 @@ if R2_OP_CONCURRENCY < 1:
         "R2_OP_CONCURRENCY=%d is invalid; using 1", R2_OP_CONCURRENCY
     )
     R2_OP_CONCURRENCY = 1
-MAX_PUBLIC_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_PUBLIC_PAYLOAD_BYTES = 10 * 1024 * 1024
 MAX_SUGGESTION_IMAGE_IDS = 1000
 MAX_PUBLIC_STATUS_IDS = 50
@@ -2031,7 +2030,10 @@ async def public_config(request: Request):
         "turnstile_enabled": TURNSTILE_ENABLED,
         "turnstile_site_key": site_key if TURNSTILE_ENABLED else "",
         "allowed_sites": ALLOWED_SITES,
-        "max_image_bytes": MAX_PUBLIC_UPLOAD_BYTES,
+        # The converter's caps, read live at startup: a still image is bounded by
+        # how long a WebP encode can run, a video only has a frame extracted.
+        "max_image_bytes": _conversion_cap_bytes("image/"),
+        "max_video_bytes": _conversion_cap_bytes("video/"),
         "supported_formats": sorted(SUPPORTED_FORMATS),
         "public_url_prefix": PUBLIC_URL_PREFIX,
         "pending_prefix": PENDING_PREFIX,
@@ -2049,21 +2051,6 @@ async def public_upload_image(
         use_test_keys=_use_test_turnstile(request),
     )
 
-    # Reject oversized uploads before reading the spooled file into memory.
-    if file.size is not None and file.size > MAX_PUBLIC_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large (max {MAX_PUBLIC_UPLOAD_BYTES // (1024 * 1024)} MB)",
-        )
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(content) > MAX_PUBLIC_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large (max {MAX_PUBLIC_UPLOAD_BYTES // (1024 * 1024)} MB)",
-        )
-
     file_name = file.filename or "image"
     ext_with_dot = os.path.splitext(file_name)[1]
     ext_lower = ext_with_dot.lower().lstrip(".")
@@ -2076,6 +2063,16 @@ async def public_upload_image(
     mime = _resolve_mime(file_name, file.content_type)
     if not (mime.startswith("image/") or mime.startswith("video/")):
         raise HTTPException(status_code=415, detail="Only image or video uploads are accepted")
+
+    # The converter's cap is the limit (the same one /api/public/config reports);
+    # refuse an oversized upload before reading the spooled file into memory.
+    if file.size is not None and file.size > _conversion_cap_bytes(mime):
+        raise _media_too_large(file.size, mime)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > _conversion_cap_bytes(mime):
+        raise _media_too_large(len(content), mime)
 
     result = await _convert_and_store(
         content=content, mime=mime, original_ext=ext_with_dot,
