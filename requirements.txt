@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
 boto3
-httpx
+httpx2
 python-multipart
 python-dotenv
 tzdata

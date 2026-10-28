@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 import time
 import zipfile
+from collections.abc import Iterator
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -19,7 +20,7 @@ from urllib.parse import parse_qs, quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
-import httpx
+import httpx2
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, Response, UploadFile
@@ -192,7 +193,7 @@ async def _load_converter_settings(attempts: int = 5, delay: float = 2.0) -> Non
     info = None
     for attempt in range(1, attempts + 1):
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 resp = await client.get(f"{CONVERSION_SERVICE_URL}/formats", timeout=5)
                 resp.raise_for_status()
                 info = resp.json()
@@ -200,7 +201,7 @@ async def _load_converter_settings(attempts: int = 5, delay: float = 2.0) -> Non
         except Exception as e:
             # An HTTP error means the converter is up and answered; retrying
             # would not change its mind.
-            if attempt == attempts or isinstance(e, httpx.HTTPStatusError):
+            if attempt == attempts or isinstance(e, httpx2.HTTPStatusError):
                 logger.warning(
                     "Could not fetch /formats from conversion service (%s); using the fallback "
                     "format list and upload caps of %d MB (images) / %d MB (video)",
@@ -462,12 +463,12 @@ def _media_too_large(size: int, mime: str) -> HTTPException:
 
 
 def _describe_converter_error(exc: BaseException) -> str:
-    """Put words to a failed call to the conversion service. httpx transport
+    """Put words to a failed call to the conversion service. httpx2 transport
     errors often stringify to nothing (a socket reset mid-upload surfaces as an
     empty anyio.BrokenResourceError), which used to reach the UI as
     "Conversion failed: "."""
     text = str(exc).strip()
-    if isinstance(exc, (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError)):
+    if isinstance(exc, (httpx2.ReadError, httpx2.WriteError, httpx2.RemoteProtocolError)):
         hint = (
             "the conversion service closed the connection before replying; an upload "
             "over its MAX_UPLOAD_MB (MAX_VIDEO_UPLOAD_MB for video) does this. The app "
@@ -487,7 +488,7 @@ async def _convert_and_store(
     if len(content) > _conversion_cap_bytes(mime):
         raise _media_too_large(len(content), mime)
     bench = _Benchmark("convert+store")
-    async with httpx.AsyncClient() as client:
+    async with httpx2.AsyncClient() as client:
         try:
             with bench.stage("slug"):
                 slug_resp = await client.get(
@@ -1087,7 +1088,7 @@ async def verify_turnstile(
     if remote_ip:
         data["remoteip"] = remote_ip
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx2.AsyncClient() as client:
             r = await client.post(TURNSTILE_VERIFY_URL, data=data, timeout=10)
             r.raise_for_status()
             result = r.json()
@@ -1152,7 +1153,7 @@ async def _flush_upload_counter() -> None:
         "fields": [{"name": "Top clients (hashed)", "value": breakdown}],
     }
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx2.AsyncClient() as client:
             await client.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
     except Exception:
         logger.exception("Discord upload rollup delivery failed")
@@ -1201,7 +1202,7 @@ async def _notify_discord(suggestion: dict, sample_image_url: str | None) -> Non
         embed["image"] = {"url": sample_image_url}
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx2.AsyncClient() as client:
             await client.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
     except Exception:
         logger.exception("Discord webhook delivery failed")
@@ -1373,7 +1374,7 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
         raise HTTPException(status_code=500, detail=f"Unexpected server error during upload: {e}")
 
 
-async def _download_csv_export(client: httpx.AsyncClient, entry: dict) -> tuple[bytes | None, str | None]:
+async def _download_csv_export(client: httpx2.AsyncClient, entry: dict) -> tuple[bytes | None, str | None]:
     """Fetch one sheet tab's CSV export. Returns (body, error); exactly one is set."""
     url = f"https://docs.google.com/spreadsheets/d/{entry['id']}/export?format=csv&gid={entry['gid']}"
     try:
@@ -1461,7 +1462,7 @@ async def _sync_prefix_checked(key: str, entries: list[dict]) -> tuple[list[str]
     staged: list[tuple[str, bytes, str]] = []
     errors: list[dict] = []
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+    async with httpx2.AsyncClient(follow_redirects=True, timeout=30) as client:
         for e in entries:
             body, err = await _download_csv_export(client, e)
             if err:
@@ -1526,7 +1527,7 @@ async def _notify_csv_sync_failure(key: str, errors: list[dict], uploaded: list[
         embed["url"] = ADMIN_URL.rstrip("/") + "/"
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx2.AsyncClient() as client:
             await client.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
     except Exception:
         logger.exception("Discord CSV sync alert delivery failed")
@@ -1534,7 +1535,8 @@ async def _notify_csv_sync_failure(key: str, errors: list[dict], uploaded: list[
 
 async def _run_csv_auto_sync() -> None:
     """One scheduled pass over every configured prefix. Each prefix is handled
-    independently, so a bad sheet in one doesn't hold up the others."""
+    independently, so a bad sheet in one doesn't hold up the others. A prefix
+    that synced is then checked for rows pointing at images that don't exist."""
     for key, entries in CSV_SOURCES.items():
         try:
             uploaded, errors = await _sync_prefix_checked(key, entries)
@@ -1545,6 +1547,7 @@ async def _run_csv_auto_sync() -> None:
             await _notify_csv_sync_failure(key, errors, uploaded)
         else:
             logger.info("CSV auto-sync updated %s: %s", key, ", ".join(uploaded) or "(nothing configured)")
+            await _check_synced_prefix(key)
 
 
 def _next_csv_sync_slot(after: datetime) -> datetime:
@@ -1611,7 +1614,8 @@ async def _csv_auto_sync_loop() -> None:
 async def sync_csv(prefix: str):
     """Re-download the CSV exports configured for `prefix` from Google Sheets and
     overwrite the matching files in R2. Fetches first, then uploads, so a failed
-    download never clobbers the live file."""
+    download never clobbers the live file. The image check then runs on what was
+    just written, and its report comes back as `check`."""
     if not S3_CONFIGURED:
         raise HTTPException(status_code=500, detail="S3 client not configured")
 
@@ -1622,7 +1626,7 @@ async def sync_csv(prefix: str):
 
     updated: list = []
     errors: list = []
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+    async with httpx2.AsyncClient(follow_redirects=True, timeout=30) as client:
         for e in entries:
             body, err = await _download_csv_export(client, e)
             if err:
@@ -1642,7 +1646,17 @@ async def sync_csv(prefix: str):
 
     if errors and not updated:
         raise HTTPException(status_code=502, detail="; ".join(f"{x['file']}: {x['error']}" for x in errors))
-    return {"status": "success", "updated": updated, "errors": errors}
+
+    # The sheet data is already written, so a check that fails is reported
+    # beside the result rather than turning the update into an error.
+    check: dict | None = None
+    check_error: str | None = None
+    try:
+        check = await asyncio.to_thread(_verify_prefix_sync, key)
+    except Exception as ex:
+        logger.exception("Data file check failed for %s after the spreadsheet update", key)
+        check_error = str(ex) or type(ex).__name__
+    return {"status": "success", "updated": updated, "errors": errors, "check": check, "check_error": check_error}
 
 
 # ---------------- File preview ----------------
@@ -1786,6 +1800,458 @@ async def preview_content(key: str, response: Response):
         "total_chars": len(text),
         "truncated": len(text) > PREVIEW_TEXT_CHARS,
     }
+
+
+# ---------------- Data file check ----------------
+
+# The sites build every image URL from a data file row and the folder the file
+# sits in: {prefix}{id}_p.webp, {prefix}{id}_t.webp and {prefix}{id}{ext}. The
+# ext is typed into the sheet by hand, and a wrong one only shows up as an image
+# that fails to load on the site, so the manager checks each reference against
+# the bucket. It does so after every spreadsheet update, the button's and the
+# scheduled one's, so a folder whose data files don't come from a sheet is not
+# checked. Data files are read under the preview's size cap.
+#
+# A report lists at most this many problems per file and unused images; the
+# counts beside the lists are exact.
+DATA_CHECK_MAX_PROBLEMS = 200
+DATA_CHECK_MAX_UNREFERENCED = 200
+# An image missing from its folder is looked for in the rest of the bucket. That
+# listing stops after this many keys, so a huge bucket cannot stall the check.
+DATA_CHECK_SCAN_MAX_KEYS = 100_000
+
+
+def _column_letter(index: int) -> str:
+    """The sheet's name for a 0-based column index: 0 -> A, 25 -> Z, 26 -> AA."""
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
+
+
+def _image_column_pairs(header: list[str]) -> list[tuple[int, int]]:
+    """(id, ext) column indexes of the image references in a data file: each
+    `<name>_id` column with a matching `<name>_ext`, plus a bare `id`/`ext`,
+    ignoring case and surrounding spaces. An id column with no ext column, such
+    as `event_id`, is a plain key rather than an image."""
+    names = [c.strip().lower() for c in header]
+    ext_columns: dict[str, int] = {}
+    for i, name in enumerate(names):
+        if name == "ext" or name.endswith("_ext"):
+            ext_columns.setdefault(name[:-3], i)
+    return [
+        (i, ext_columns[name[:-2]])
+        for i, name in enumerate(names)
+        if (name == "id" or name.endswith("_id")) and name[:-2] in ext_columns
+    ]
+
+
+def _read_data_file_sync(key: str) -> tuple[bytes | None, str | None]:
+    """Fetch a data file for the check. Returns (body, error); exactly one is
+    set. Oversized files are refused before their body is read."""
+    try:
+        obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+    except ClientError as ex:
+        code = ex.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None, "file not found"
+        return None, f"read failed: {code or ex}"
+    except Exception as ex:
+        return None, f"read failed: {ex}"
+    size = int(obj.get("ContentLength") or 0)
+    if size > PREVIEW_MAX_BYTES:
+        obj["Body"].close()
+        return None, (
+            f"too large to check ({size / (1024 * 1024):.1f} MB; "
+            f"the limit is {PREVIEW_MAX_BYTES // (1024 * 1024)} MB)"
+        )
+    try:
+        return obj["Body"].read(), None
+    except Exception as ex:
+        return None, f"read failed: {ex}"
+
+
+def _missing_image_message(img_id: str, prefix: str, elsewhere: list[str]) -> str:
+    """Message for an id with no files under `prefix`, saying where else the
+    bucket has it. The pending prefix is described rather than named: an image
+    there came in with a suggestion that nobody has approved yet."""
+    places = [folder or "the bucket root" for folder in elsewhere if folder != PENDING_PREFIX]
+    where = [f"in {', '.join(places)}"] if places else []
+    if PENDING_PREFIX in elsewhere:
+        where.append("waiting in a suggestion that has not been approved")
+    tail = f"; it is {' and '.join(where)}" if where else ""
+    return f"No files for {img_id} in {prefix}{tail}."
+
+
+def _reference_problems(
+    prefix: str, raw_id: str, raw_ext: str, names: set[str], by_stem: dict[str, list[str]]
+) -> Iterator[tuple[str, dict]]:
+    """What would stop a site loading the image one row points at, judged
+    against `names`, the files directly under `prefix` (`by_stem` indexes them
+    by name minus extension). Yields (cell, problem) with cell "id" or "ext",
+    whichever needs correcting. The sites use both cells exactly as typed, so
+    stray spaces are a problem of their own; files are looked up by the
+    trimmed values, so the rest says what is still wrong once they are gone."""
+    img_id, ext = raw_id.strip(), raw_ext.strip()
+    if not img_id and not ext:
+        # Cells holding nothing but spaces are not empty to the sites: they
+        # read the pair as an image and request it.
+        yield ("id" if raw_id else "ext"), {
+            "code": "whitespace",
+            "message": (
+                "Both cells hold only spaces; the sites read that as an image, so clear them."
+                if raw_id and raw_ext
+                else "The cell holds only spaces; the sites read that as an image, so clear it."
+            ),
+            "fix": None,
+        }
+        return
+    for cell, raw, value in (("id", raw_id, img_id), ("ext", raw_ext, ext)):
+        if value and raw != value:
+            yield cell, {
+                "code": "whitespace",
+                "message": (
+                    f"The cell is {raw!r}; the sites use it exactly as typed, "
+                    "spaces included, so the link breaks."
+                ),
+                "fix": value,
+            }
+    if not img_id:
+        yield "id", {
+            "code": "missing_id",
+            "message": f"The id is missing, but the extension is {ext}.",
+        }
+        return
+
+    originals = sorted(by_stem.get(img_id, []))
+    previews = [f"{img_id}_p.webp", f"{img_id}_t.webp"]
+    present = [p for p in previews if p in names]
+    if not originals and not present:
+        # Whatever the ext cell says, no extension would fix this; where the
+        # image went is the useful answer, and the bucket-wide search adds it.
+        yield "id", {
+            "code": "missing_image",
+            "message": _missing_image_message(img_id, prefix, []),
+            "elsewhere": [],
+        }
+        return
+
+    known_ext = os.path.splitext(originals[0])[1] if len(originals) == 1 else None
+    actual = (
+        f"the file is {originals[0]}" if len(originals) == 1
+        else f"the files are {', '.join(originals)}"
+    )
+    if not ext:
+        yield "ext", {
+            "code": "missing_ext",
+            "message": (
+                f"The extension is missing; {actual}." if originals
+                else f"The extension is missing, and {prefix} has no original for {img_id}."
+            ),
+            "fix": known_ext,
+        }
+    elif f"{img_id}{ext}" not in names:
+        if originals:
+            # Also catches a missing dot ("png") and the wrong case (".PNG" for
+            # ".png"): keys are case-sensitive, so the site's request fails too.
+            yield "ext", {
+                "code": "wrong_ext",
+                "message": f"{img_id}{ext} doesn't exist; {actual}.",
+                "fix": known_ext,
+                "found": originals,
+            }
+        else:
+            yield "ext", {
+                "code": "missing_original",
+                "message": f"{img_id}{ext} doesn't exist; {prefix} has {' and '.join(present)} but no original.",
+            }
+    absent = [p for p in previews if p not in names]
+    if absent:
+        yield "id", {
+            "code": "missing_preview",
+            "message": f"{' and '.join(absent)} {'is' if len(absent) == 1 else 'are'} missing.",
+        }
+
+
+def _check_data_file_sync(
+    prefix: str,
+    name: str,
+    names: set[str],
+    by_stem: dict[str, list[str]],
+    referenced: set[str],
+) -> dict:
+    """Check the image references in one data file under `prefix`. Each id it
+    names is added to `referenced`, and `problem_count` counts every problem,
+    including those past the DATA_CHECK_MAX_PROBLEMS kept. A file that cannot
+    be read or parsed comes back with `error` set rather than raising, so one
+    bad file never hides the others."""
+    result: dict = {
+        "columns": [],
+        "rows": 0,
+        "refs": 0,
+        "problems": [],
+        "problem_count": 0,
+        "error": None,
+        "encoding": None,
+    }
+    body, result["error"] = _read_data_file_sync(f"{prefix}{name}")
+    if body is None:
+        return result
+    try:
+        text, result["encoding"] = _decode_preview_text(body)
+    except HTTPException:
+        result["error"] = "this looks like a binary file, not text"
+        return result
+
+    def _add(problem: dict) -> None:
+        result["problem_count"] += 1
+        if len(result["problems"]) < DATA_CHECK_MAX_PROBLEMS:
+            result["problems"].append(problem)
+
+    delimiter = _PREVIEW_TABLE_DELIMITERS[os.path.splitext(name)[1].lower()]
+    header: list[str] | None = None
+    pairs: list[tuple[int, int]] = []
+    # First and last row of the current run of empty rows.
+    empty_run: list[int] = []
+
+    def _report_empty_run(above_header: bool = False) -> None:
+        if empty_run and pairs:
+            first, last = empty_run
+            rows, each, them = (
+                (f"Row {first} is", "it", "the row") if first == last
+                else (f"Rows {first}–{last} are", "each", "the rows")
+            )
+            _add({
+                "row": first,
+                "column": header[0],
+                "cell": f"A{first}",
+                "id": "",
+                "ext": "",
+                "code": "blank_row",
+                "message": (
+                    f"{rows} empty, but the sites take the first row as the header, so they "
+                    f"find none of the columns and no image loads. Delete {them}."
+                    if above_header else
+                    f"{rows} empty, but the sites don't skip empty rows: {each} becomes an "
+                    f"entry with no image. Delete {them}."
+                ),
+                "fix": None,
+            })
+        empty_run.clear()
+
+    try:
+        # Rows are numbered the way the sheet numbers them, so row 161 here is row
+        # 161 in Google Sheets: the header and blank rows count (an empty sheet row
+        # exports as ",,,"), and a quoted cell holding a line break is still one row.
+        # Records are checked as they are read, so an export padded with a huge
+        # number of empty rows never sits in memory as a list.
+        reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+        for row, record in enumerate(reader, start=1):
+            if not any(c.strip() for c in record):
+                # Papa Parse, which every site uses, drops a truly empty line but
+                # keeps an empty sheet row (",,,"): the dokimotes loader turns one
+                # into an "Unknown" emote with a broken image, and one above the
+                # header becomes the header itself.
+                if record not in ([], [""]):
+                    if empty_run:
+                        empty_run[1] = row
+                    else:
+                        empty_run.extend((row, row))
+                continue
+            if header is None:
+                header = [c.strip() for c in record]
+                pairs = _image_column_pairs(header)
+                result["columns"] = [{"id": header[i], "ext": header[j]} for i, j in pairs]
+                _report_empty_run(above_header=True)
+                # Matching ignores case and spaces, but the sites look a column up
+                # by its exact header text, so "Image_Ext" gives them nothing.
+                for col in sorted({col for pair in pairs for col in pair}):
+                    canonical = header[col].lower()
+                    if record[col] != canonical:
+                        _add({
+                            "row": row,
+                            "column": canonical,
+                            "cell": f"{_column_letter(col)}{row}",
+                            "id": "",
+                            "ext": "",
+                            "code": "header",
+                            "message": (
+                                f"The header is {record[col]!r}, but the sites look the column up "
+                                f"as {canonical} exactly, so they find no value in any row."
+                            ),
+                            "fix": canonical,
+                        })
+                continue
+            _report_empty_run()
+            result["rows"] += 1
+            for id_col, ext_col in pairs:
+                raw_id = record[id_col] if id_col < len(record) else ""
+                raw_ext = record[ext_col] if ext_col < len(record) else ""
+                if not raw_id and not raw_ext:
+                    continue  # an optional image, left blank
+                result["refs"] += 1
+                img_id, ext = raw_id.strip(), raw_ext.strip()
+                if img_id:
+                    referenced.add(img_id)
+                for cell, problem in _reference_problems(prefix, raw_id, raw_ext, names, by_stem):
+                    col = id_col if cell == "id" else ext_col
+                    _add({
+                        "row": row,
+                        "column": header[col],
+                        "cell": f"{_column_letter(col)}{row}",
+                        "id": img_id,
+                        "ext": ext,
+                        "fix": None,
+                        **problem,
+                    })
+        _report_empty_run()
+    except csv.Error as ex:
+        # The manager shows a file it could not parse as unchecked, so the rows
+        # read before the bad record are dropped rather than counted unseen.
+        result.update(columns=[], rows=0, refs=0, problems=[], problem_count=0)
+        result["error"] = f"unparseable CSV: {ex}"
+    return result
+
+
+def _find_elsewhere_sync(prefix: str, ids: set[str]) -> dict[str, list[str]]:
+    """Every folder other than `prefix` holding files for any of `ids`, from one
+    listing of the whole bucket. An image missing from its folder was usually
+    uploaded to another one, or is still waiting in a suggestion, and saying
+    where turns "it's gone" into a quick fix."""
+    found: dict[str, set[str]] = {}
+    scanned = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=R2_BUCKET_NAME):
+        contents = page.get("Contents", [])
+        for obj in contents:
+            key = obj["Key"]
+            folder = key[: key.rfind("/") + 1]
+            if folder == prefix:
+                continue
+            name = key[len(folder):]
+            stem = name[:-7] if name.endswith(("_p.webp", "_t.webp")) else os.path.splitext(name)[0]
+            if stem in ids:
+                found.setdefault(stem, set()).add(folder)
+        scanned += len(contents)
+        if scanned >= DATA_CHECK_SCAN_MAX_KEYS:
+            logger.info("Stopped looking for images missing from %s after %d keys", prefix, scanned)
+            break
+    return {img_id: sorted(folders) for img_id, folders in found.items()}
+
+
+def _verify_prefix_sync(prefix: str) -> dict:
+    """Check every image reference in the data files (CSV/TSV) directly under
+    `prefix`, which ends with exactly one "/", against the files there. Files
+    with no image columns are listed too. Only listing the prefix can raise; a
+    data file that fails is reported in its own entry."""
+    names: set[str] = set()
+    for obj in _list_all_objects(prefix):
+        name = obj["Key"][len(prefix):]
+        # The sites resolve an image in its data file's own folder, never below.
+        if name and "/" not in name:
+            names.add(name)
+    # A preview "x_p.webp" files under the stem "x_p", so it never passes for
+    # the original of image "x".
+    by_stem: dict[str, list[str]] = {}
+    for name in names:
+        stem, ext = os.path.splitext(name)
+        if ext:
+            by_stem.setdefault(stem, []).append(name)
+    groups = {name[:-7] for name in names if name.endswith(("_p.webp", "_t.webp"))}
+
+    sources = {e["file"]: e for e in CSV_SOURCES.get(prefix, [])}
+    referenced: set[str] = set()
+    files = []
+    for name in sorted(names):
+        if os.path.splitext(name)[1].lower() not in _PREVIEW_TABLE_DELIMITERS:
+            continue
+        entry = sources.get(name)
+        files.append({
+            "file": name,
+            "sheet_url": _sheet_url(entry) if entry else None,
+            **_check_data_file_sync(prefix, name, names, by_stem, referenced),
+        })
+
+    missing = [p for f in files for p in f["problems"] if p["code"] == "missing_image"]
+    if missing:
+        try:
+            elsewhere = _find_elsewhere_sync(prefix, {p["id"] for p in missing})
+        except Exception:
+            logger.exception("Looking for images missing from %s failed (non-fatal)", prefix)
+            elsewhere = {}
+        for p in missing:
+            p["elsewhere"] = elsewhere.get(p["id"], [])
+            p["message"] = _missing_image_message(p["id"], prefix, p["elsewhere"])
+
+    # Listing an image as unused invites deleting it, so the list is only given
+    # when every data file was read: one that wasn't might be what uses it.
+    unreferenced: list[str] = []
+    if any(f["columns"] for f in files) and not any(f["error"] for f in files):
+        unreferenced = sorted(groups - referenced)
+    return {
+        "prefix": prefix,
+        "checked_at": _utc_now_iso(),
+        "files": files,
+        "refs": sum(f["refs"] for f in files),
+        "errors": sum(f["problem_count"] for f in files),
+        "unreferenced": unreferenced[:DATA_CHECK_MAX_UNREFERENCED],
+        "unreferenced_count": len(unreferenced),
+    }
+
+
+async def _notify_data_check_problems(report: dict) -> None:
+    prefix = report["prefix"]
+    lines = [
+        f"`{f['file']}` row {p['row']}: {p['message']}"
+        for f in report["files"]
+        for p in f["problems"]
+    ][:10]
+    if report["errors"] > len(lines):
+        lines.append(f"... and {report['errors'] - len(lines)} more")
+    detail = "\n".join(lines)
+    if len(detail) > 1000:
+        detail = detail[:1000] + "\n... (truncated)"
+    logger.warning("Broken image references under %s: %s", prefix, detail.replace("\n", "; "))
+
+    if not DISCORD_WEBHOOK:
+        return
+    embed: dict = {
+        "title": "Broken image references",
+        "color": 0xFEE75C,
+        "description": (
+            f"The data files under `{prefix}` have {report['errors']} image reference problem(s): "
+            "rows that point at files that don't exist (or cells the sites can't use), "
+            "so the site cannot load those images."
+        ),
+        "fields": [{"name": "Problems", "value": detail}],
+    }
+    if ADMIN_URL:
+        embed["url"] = f"{ADMIN_URL.rstrip('/')}/?prefix={quote(prefix)}"
+
+    try:
+        async with httpx2.AsyncClient() as client:
+            await client.post(DISCORD_WEBHOOK, json={"embeds": [embed]}, timeout=10)
+    except Exception:
+        logger.exception("Discord data check alert delivery failed")
+
+
+async def _check_synced_prefix(prefix: str) -> None:
+    """Check a prefix the scheduled sync just wrote. Nobody is looking at the
+    manager when that runs, so a sheet edit pointing at a missing image would
+    otherwise only surface as a broken image on the site."""
+    try:
+        report = await asyncio.to_thread(_verify_prefix_sync, prefix)
+    except Exception:
+        logger.exception("Data file check failed for %s after the CSV auto-sync", prefix)
+        return
+    for f in report["files"]:
+        if f["error"]:
+            logger.warning("Data file check could not read %s%s: %s", prefix, f["file"], f["error"])
+    if report["errors"]:
+        await _notify_data_check_problems(report)
+    else:
+        logger.info("Data file check for %s: %d image reference(s), no problems", prefix, report["refs"])
 
 
 @app.delete("/api/content", dependencies=[Depends(require_api_key)])

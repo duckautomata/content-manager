@@ -382,7 +382,9 @@ count, size and last-modified time, and offers:
 - **Open sheet** — opens the Google Sheet tab the file is exported from in a new tab.
 - **Update from spreadsheet** — downloads each configured tab and overwrites the
   matching file, then reports per file what changed (rows before → after, or
-  "unchanged" when the content is identical) and flags a drop of 50% or more.
+  "unchanged" when the content is identical) and flags a drop of 50% or more. The
+  [image check](#image-check) then runs on the folder, and its result shows under
+  that report.
 
 Other text files in a prefix (`.json`, `.txt`, `.md`, …) get the same **View** action.
 
@@ -419,6 +421,66 @@ so the interval survives container restarts — keep `./data` mounted. On first 
 (or if the container was down through a slot) the next run is the upcoming noon ET,
 not immediately on boot.
 
+#### Image check
+
+The sites build every image URL from a data file row and the folder the file sits in:
+`{folder}{id}_p.webp` (preview), `{folder}{id}_t.webp` (thumbnail) and
+`{folder}{id}{ext}` (the original). The extension is typed into the sheet by hand, and
+when it is wrong — `.png` for a `.jpg` — the original fails to load on the site and
+nothing else says so. The manager checks for this.
+
+The check runs as part of every **Update from spreadsheet**: once the new files are
+written, every image the CSV/TSV files directly in the folder reference is checked
+against the files actually in the folder. The result shows in the **Data files** panel
+under the update summary, and when there are problems the toast says how many too, so
+they are seen even with the panel collapsed. If the check itself fails, the update
+still stands and the panel says why.
+
+After a scheduled sync (see [Automatic sync](#automatic-sync)), every prefix that synced
+is checked the same way, and any problems are posted to `DISCORD_WEBHOOK` with the
+first few rows and, when `ADMIN_URL` is set, a link that opens the folder in the manager.
+A folder whose CSVs are not synced from a sheet (not in `CSV_SOURCES`) is not checked.
+
+Image columns are recognized by name, with nothing to configure: a header pair
+`<name>_id` + `<name>_ext` (`image_id`/`image_ext`, `media_id`/`media_ext`), or a bare
+`id` + `ext`. Case and surrounding spaces are ignored when matching the names, but a
+header that isn't exactly the lower-case name is reported (see **Header** below). An
+`_id` column without an `_ext` partner, such as `event_id`, is an ordinary key and is
+not checked. A row with both cells of a pair empty has no image there and is skipped;
+a cell holding only spaces is not empty (see **Whitespace**).
+
+Each problem gives its row as the sheet numbers it (the header and blank rows count),
+and for a synced file the row links straight to the cell in Google Sheets. Every
+problem stops the site loading an image. It reports:
+
+- **Wrong extension** — `{id}{ext}` doesn't exist, but the folder has the image under
+  another extension (a missing dot or different case counts too), and says which.
+- **Missing original** — the preview and thumbnail are there, the original isn't.
+- **Missing image** — the folder has no files for the id at all. This is reported even
+  when the extension cell is blank, since no extension would fix it. The rest of the
+  bucket is searched for it, so an image uploaded to the wrong folder, or still waiting
+  in a suggestion that has not been approved, is pointed out.
+- **Missing preview** — `{id}_p.webp` or `{id}_t.webp` isn't there.
+- **Missing id** / **missing extension** — one cell of the pair is empty.
+- **Whitespace** — a cell has spaces around its value, or holds nothing but spaces. The
+  sites use each cell exactly as typed, so a stray space ends up in the image's URL and
+  the link breaks, and a cell of only spaces reads to them as an image, not an empty cell.
+- **Header** — an image column's header isn't exactly its lower-case name, such as
+  `Image_Ext` or `image_ext ` with a trailing space. The sites look a column up by its
+  exact name, so to them that column is empty in every row. Reported on the header row.
+- **Empty rows** — an empty sheet row exports as `,,,`, and the sites don't skip it.
+  Below the header it becomes an entry with no image (dokimotes shows it as an "Unknown"
+  emote); above the header it becomes the header itself, so no column is found and no
+  image loads. A run of them is reported once. A truly empty line is skipped by the sites
+  and is not reported.
+
+Where the fix is certain — the one extension the folder has for that id, the value
+without its spaces, or the header's lower-case name — a button copies it.
+
+Images in the folder that no data file references are listed too, collapsed; usually
+that is an upload that never made it into the sheet. The list is left out when a data
+file could not be read, since that file may be the one using them.
+
 ### Cloudflare Turnstile setup
 
 1. Cloudflare dashboard → **Turnstile** → **Add site**.
@@ -447,7 +509,7 @@ Content (used by the manager page):
 |--------|-----------------------------------------------|----------------------------------------------------------|
 | GET    | `/api/content?prefix=`                        | Grouped listing: `images`, `videos`, `others`, `public_url_prefix`, `common_prefixes`, and `csv_sources` as `[{file, sheet_url}]` for the prefix |
 | GET    | `/api/content/preview?key=`                   | Parsed contents of a text-ish object for the in-app viewer. CSV/TSV → `{kind: "table", header, rows, total_rows, truncated, row_limit, …}` (first 5000 rows); other text → `{kind: "text", text, total_chars, truncated}`. Also `size`, `last_modified`, `etag`, `encoding`. `404` missing, `413` over 8 MB, `415` binary/unsupported, `422` unparseable CSV. Successful responses carry `Cache-Control: no-store`. |
-| POST   | `/api/content/sync-csv?prefix=`               | Re-download the prefix's configured sheet tabs → `{updated, errors}` |
+| POST   | `/api/content/sync-csv?prefix=`               | Re-download the prefix's configured sheet tabs → `{updated, errors, check, check_error}`. `check` is the [Image check](#image-check) of the prefix's CSV/TSV files, run once the new ones are written, or `null` with the reason in `check_error` when the check itself failed (the update still answers `200`): `{prefix, checked_at, refs, errors, unreferenced, unreferenced_count, files: [{file, sheet_url, columns, rows, refs, problems, problem_count, error, encoding}]}`, each problem `{row, column, cell, id, ext, code, message, fix}` plus `found` (wrong_ext) and `elsewhere` (missing_image). `errors` counts every problem, including those past the 200 listed per file. `502`, with no check, when every file failed. |
 | POST   | `/api/upload`                                 | multipart `prefix`, `file`, optional `override_filename` |
 | DELETE | `/api/content?key=`                           | Delete one object                                        |
 | POST   | `/api/content/bulk-delete`                    | `{keys}` — delete up to 1000 objects                     |

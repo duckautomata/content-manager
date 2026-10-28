@@ -1,7 +1,7 @@
-// Files page: prefix navigation, data-file panel with spreadsheet sync, media
-// tiles / file rows, preview dialog, uploads, delete + delayed delete, and the
-// in-app viewer. One `state`, one idempotent render per load, in-place patches
-// for single-item actions.
+// Files page: prefix navigation, data-file panel with spreadsheet sync (and the
+// image-reference check each update brings back), media tiles / file rows,
+// preview dialog, uploads, delete + delayed delete, and the in-app viewer. One
+// `state`, one idempotent render per load, in-place patches for single-item actions.
 
 import {
     el, icon, apiJson, ApiError, fmt, timeEl, keys, setUrlState, urlParams, store, extOf,
@@ -15,6 +15,7 @@ import {
 } from './shell.js';
 import { createUploader, replaceProblem } from './uploads.js';
 import { createViewer } from './viewer.js';
+import { createDataCheck } from './datacheck.js';
 
 const DEFAULT_PREFIX = 'home/';
 const SECTION_KEY = 'cm_section';
@@ -65,6 +66,7 @@ const dom = {
     folders: $('folders'), prefixNote: $('prefix-note'),
     dataPanel: $('data-panel'), dataCount: $('data-count'), dataFilterChip: $('data-filter-chip'),
     syncBtn: $('sync-btn'), dataToggle: $('data-toggle'), dataBody: $('data-body'), dataRows: $('data-rows'), syncResult: $('sync-result'),
+    dataCheck: $('data-check'),
     sectionbar: $('sectionbar'), filterChip: $('filter-chip'),
     tabs: { images: $('tab-images'), videos: $('tab-videos'), others: $('tab-others') },
     sections: { images: $('sec-images'), videos: $('sec-videos'), others: $('sec-others') },
@@ -76,7 +78,7 @@ const dom = {
     previewMedia: $('preview-media'), previewMeta: $('preview-meta'), previewActions: $('preview-actions'),
 };
 
-let refresh, filter, uploader, viewer;
+let refresh, filter, uploader, viewer, dataCheck;
 
 // ---------------------------------------------------------------- helpers
 
@@ -204,6 +206,7 @@ async function load({ silent = false } = {}) {
         dom.dataRows.replaceChildren();
         dom.dataPanel.hidden = true;
         dom.syncResult.hidden = true;
+        dataCheck.clear();
         dom.folders.hidden = true;
         dom.empty.hidden = true;
         renderSkeletons();
@@ -759,6 +762,8 @@ function openPreview(slug) {
     const grid = dom.containers[entry.kind === 'video' ? 'videos' : 'images'];
     previewList = visibleTiles(grid).map(o => o.closest('.tile').dataset.id);
     previewIndex = previewList.indexOf(slug);
+    // Opened from the image check for a tile the filter hides: show it on its own.
+    if (previewIndex < 0) { previewList = [slug]; previewIndex = 0; }
     renderPreview(entry);
     if (!dom.preview.open) {
         openDialog(dom.preview, { initialFocus: '#preview-copy-id', onClose: () => { const v = dom.previewMedia.querySelector('video'); if (v) v.pause(); dom.previewMedia.replaceChildren(); } });
@@ -1098,9 +1103,12 @@ async function syncFromSheet(extraBusyBtn = null) {
     setBusy(dom.syncBtn, true, 'Updating…');
     if (extraBusyBtn) setBusy(extraBusyBtn, true, 'Updating…');
     dom.dataPanel.setAttribute('aria-busy', 'true');
+    // The last update's check goes; this update brings its own (none if it fails).
+    dataCheck.clear();
     showSyncResult('info', [el('div', { class: 'notice__line' }, `Downloading ${fmt.plural(sources.length, 'sheet')}…`)]);
+    const prefix = state.prefix;
     try {
-        const data = await apiJson(`content/sync-csv?prefix=${encodeURIComponent(state.prefix)}`, { method: 'POST' });
+        const data = await apiJson(`content/sync-csv?prefix=${encodeURIComponent(prefix)}`, { method: 'POST' });
         const updated = data.updated || [];
         const errors = data.errors || [];
         // Fresh listing (new size/last_modified) so row metadata and cache keys move on.
@@ -1149,7 +1157,15 @@ async function syncFromSheet(extraBusyBtn = null) {
         const tone = errors.length ? (updated.length ? 'warn' : 'danger') : 'success';
         lines.unshift(el('div', { class: 'notice__line' }, el('strong', null, `${errors.length ? 'Partly updated' : 'Updated'} at ${fmt.time(new Date().toISOString())}`), errors.length ? ` — ${errors.length} failed` : changed ? ` — ${fmt.plural(changed, 'file')} changed` : ' — nothing changed'));
         showSyncResult(tone, lines);
-        toast(errors.length ? `Updated ${updated.length}, ${errors.length} failed` : `Updated ${updated.join(', ') || 'nothing'}`, { tone: errors.length ? 'error' : 'success' });
+        // The server checked the image references in what it just wrote. The
+        // report is about that folder, so it is not drawn if the page has moved on.
+        if (state.prefix === prefix && (data.check || data.check_error)) dataCheck.show(data.check, data.check_error);
+        // Problems, or a check that could not run, also make it an error toast:
+        // that is seen even with the panel collapsed on a phone or the viewer open.
+        const problems = (data.check && data.check.errors) || 0;
+        const done = errors.length ? `Updated ${updated.length}, ${errors.length} failed` : `Updated ${updated.join(', ') || 'nothing'}`;
+        const note = problems ? ` — ${fmt.plural(problems, 'image reference problem')}` : data.check_error ? ' — the image check failed' : '';
+        toast(done + note, { tone: errors.length || note ? 'error' : 'success' });
     } catch (err) {
         if (!(err instanceof ApiError && err.status === 401)) {
             showSyncResult('danger', [el('div', { class: 'notice__line' }, icon('alert'), `Update failed: ${err.detail || err.message}`, el('button', { type: 'button', class: 'btn btn--sm', onclick: () => syncFromSheet() }, 'Retry'))]);
@@ -1353,6 +1369,12 @@ async function boot() {
         thumbUrl: (prefix, r) => urlFor(r.thumbnail),
         onDone: onUploaded,
         onDrained: () => load({ silent: true }),
+    });
+
+    dataCheck = createDataCheck({
+        root: dom.dataCheck,
+        hasImage: (slug) => state.mediaIndex.has(slug),
+        onOpenImage: (slug) => openPreview(slug),
     });
 
     refresh = initRefresh(() => { if (viewer.isOpen()) viewer.refreshIfOpen(viewer.currentFile()); else load({ silent: true }); });

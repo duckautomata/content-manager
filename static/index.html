@@ -22,7 +22,8 @@
             "./js/ui.js": "./js/ui.js?v=__ASSET_VERSION__",
             "./js/shell.js": "./js/shell.js?v=__ASSET_VERSION__",
             "./js/uploads.js": "./js/uploads.js?v=__ASSET_VERSION__",
-            "./js/viewer.js": "./js/viewer.js?v=__ASSET_VERSION__"
+            "./js/viewer.js": "./js/viewer.js?v=__ASSET_VERSION__",
+            "./js/datacheck.js": "./js/datacheck.js?v=__ASSET_VERSION__"
         }
     }
     </script>
@@ -34,6 +35,7 @@
     <link rel="modulepreload" href="js/shell.js?v=__ASSET_VERSION__">
     <link rel="modulepreload" href="js/uploads.js?v=__ASSET_VERSION__">
     <link rel="modulepreload" href="js/viewer.js?v=__ASSET_VERSION__">
+    <link rel="modulepreload" href="js/datacheck.js?v=__ASSET_VERSION__">
     <link rel="icon"
         href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📦</text></svg>">
 </head>
@@ -139,6 +141,7 @@
                 <div class="panel__body" id="data-body">
                     <div class="rows" id="data-rows"></div>
                     <div class="notice" id="sync-result" role="status" hidden></div>
+                    <div id="data-check" class="notice datacheck" hidden></div>
                 </div>
             </section>
 
