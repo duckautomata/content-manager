@@ -442,6 +442,34 @@ curl -s -D - -o /dev/null -H "Origin: https://www.duck-automata.com" \
 Right after a purge this shows `cf-cache-status: MISS`, then `HIT` on the next request,
 and the `etag` matches the object's MD5 in R2.
 
+### CDN cache warmup
+
+A new image only reaches the CDN when someone first asks for it, so its first viewer
+waits on a read from R2. The manager requests the preview (`_p.webp`) and thumbnail
+(`_t.webp`) ahead of time so they are already cached:
+
+- **After every upload** from the manager, in the background.
+- **After a suggestion is approved**, for the images it moved to the site.
+- **Warm cache** on the media tab bar, for every preview and thumbnail in the folder,
+  subfolders included. It runs in the background on the server, the button counts
+  progress, and a toast reports how many files were fetched into the cache, how many
+  were cached already, and any that failed. Leaving the page does not stop it.
+
+Originals are not warmed: the sites only open them on click, and a video can be
+hundreds of MB. No `Origin` header is sent, because the sites load images with plain
+`<img>` tags, which send none, and that header picks the cache entry (see
+[CDN cache purge](#cdn-cache-purge)).
+
+Cloudflare caches per data center, so on its own a warmup only fills the data center
+nearest this server. Turn on **Tiered Cache** (Smart Tiered Caching Topology, under
+Caching → Tiered Cache): every data center then asks one upper tier before R2, and
+warming fills that tier, so the first view anywhere is served by Cloudflare. Cloudflare
+can still evict rarely requested files before their TTL, so warming does the most good
+just before people look.
+
+Nothing to configure beyond `PUBLIC_URL_PREFIX`. A warmup that fails after an upload or
+approval is only logged; the upload itself already succeeded.
+
 #### Automatic sync
 
 Set `CSV_AUTO_SYNC_DAYS` to a positive number and the server re-syncs every
@@ -565,6 +593,8 @@ Content (used by the manager page):
 | GET    | `/api/content/preview?key=`                   | Parsed contents of a text-ish object for the in-app viewer. CSV/TSV → `{kind: "table", header, rows, total_rows, truncated, row_limit, …}` (first 5000 rows); other text → `{kind: "text", text, total_chars, truncated}`. Also `size`, `last_modified`, `etag`, `encoding`. `404` missing, `413` over 8 MB, `415` binary/unsupported, `422` unparseable CSV. Successful responses carry `Cache-Control: no-store`. |
 | POST   | `/api/content/sync-csv?prefix=`               | Re-download the prefix's configured sheet tabs → `{updated, errors, check, check_error}`. `check` is the [Image check](#image-check) of the prefix's CSV/TSV files, run once the new ones are written, or `null` with the reason in `check_error` when the check itself failed (the update still answers `200`): `{prefix, checked_at, refs, errors, unreferenced, unreferenced_count, files: [{file, sheet_url, columns, rows, refs, problems, problem_count, error, encoding}]}`, each problem `{row, column, cell, id, ext, code, message, fix}` plus `found` (wrong_ext) and `elsewhere` (missing_image). `errors` counts every problem, including those past the 200 listed per file. `502`, with no check, when every file failed. |
 | POST   | `/api/content/purge-cache`                    | `{keys}` — purge the CDN copies of up to 100 `.csv`/`.tsv`/`.json` objects (see [CDN cache purge](#cdn-cache-purge)) → `{purged, errors: [{key, error}]}`. `400` for other file types, `502` when nothing was purged, `503` when not configured. |
+| POST   | `/api/content/warm-cache?prefix=`             | Start a background [warmup](#cdn-cache-warmup) of every `_p.webp`/`_t.webp` under the prefix; returns the job. If one is already running for the prefix, that job is returned instead. `400` for an empty prefix or `_suggestions/`. |
+| GET    | `/api/content/warm-cache?prefix=`             | Progress of the prefix's latest warmup: `{prefix, total, done, cached, fetched, failed, errors, error, started_at, finished_at}`. `total` is `null` while the folder is being listed and `finished_at` is `null` until it ends. `404` if none has run since the server started. |
 | POST   | `/api/upload`                                 | multipart `prefix`, `file`, optional `override_filename` |
 | DELETE | `/api/content?key=`                           | Delete one object                                        |
 | POST   | `/api/content/bulk-delete`                    | `{keys}` — delete up to 1000 objects                     |

@@ -68,7 +68,7 @@ const dom = {
     dataPanel: $('data-panel'), dataCount: $('data-count'), dataFilterChip: $('data-filter-chip'),
     syncBtn: $('sync-btn'), purgeBtn: $('purge-btn'), dataToggle: $('data-toggle'), dataBody: $('data-body'), dataRows: $('data-rows'), syncResult: $('sync-result'),
     dataCheck: $('data-check'),
-    sectionbar: $('sectionbar'), filterChip: $('filter-chip'),
+    sectionbar: $('sectionbar'), filterChip: $('filter-chip'), warmBtn: $('warm-btn'),
     tabs: { images: $('tab-images'), videos: $('tab-videos'), others: $('tab-others') },
     sections: { images: $('sec-images'), videos: $('sec-videos'), others: $('sec-others') },
     containers: { images: $('grid-images'), videos: $('grid-videos'), others: $('rows-others') },
@@ -305,6 +305,7 @@ function render() {
     renderFolders();
     renderDataPanel();
     renderMedia();
+    renderWarmBtn();
     applyFilter();
     const remembered = (store.get(SECTION_KEY, {}) || {})[state.prefix];
     selectSection(pickSection(state.section || urlParams().get('section') || remembered), { silent: true });
@@ -1253,6 +1254,53 @@ function purgeOffer(keysToPurge) {
     return line;
 }
 
+// ---- CDN cache warmup
+
+const WARM_POLL_MS = 1000;
+const warmRuns = new Map();   // prefix -> latest progress of a warmup this page is following
+
+// Uploads and approvals warm their own files; this covers a whole folder, e.g.
+// before announcing a batch of new images.
+function renderWarmBtn() {
+    const btn = dom.warmBtn;
+    btn.hidden = !state.publicUrlPrefix || isPendingView() || !(state.images.length || state.videos.length);
+    const run = warmRuns.get(state.prefix);
+    if (!run) { setBusy(btn, false); return; }
+    if (!btn.classList.contains('is-busy')) setBusy(btn, true, 'Warming…');
+    if (run.total != null) btn.querySelector('.btn__label').textContent = `Warming ${fmt.int(run.done)}/${fmt.int(run.total)}`;
+}
+
+async function warmFolder() {
+    const prefix = state.prefix;
+    if (warmRuns.has(prefix)) return;
+    const url = `content/warm-cache?prefix=${encodeURIComponent(prefix)}`;
+    warmRuns.set(prefix, { total: null, done: 0 });
+    renderWarmBtn();
+    try {
+        let job = await apiJson(url, { method: 'POST' });
+        for (;;) {
+            warmRuns.set(prefix, job);
+            if (state.prefix === prefix) renderWarmBtn();
+            if (job.finished_at) break;
+            await new Promise(r => setTimeout(r, WARM_POLL_MS));
+            job = await apiJson(url);
+        }
+        const errors = job.errors || [];
+        if (job.error) toast(`Warming ${prefix} failed: ${job.error}`, { tone: 'error' });
+        else if (!job.total) toast(`${prefix} has no previews or thumbnails to warm.`);
+        else {
+            const parts = [`${fmt.int(job.fetched)} fetched into the cache`, `${fmt.int(job.cached)} already cached`];
+            if (job.failed) parts.push(`${fmt.int(job.failed)} failed`);
+            toast(`Warmed ${prefix}: ${parts.join(', ')}.`, { tone: job.failed ? 'error' : 'success', duration: 8000, details: errors.length ? errors.join('\n') : null });
+        }
+    } catch (err) {
+        if (!(err instanceof ApiError && err.status === 401)) toast(`Warming ${prefix} failed: ${err.detail || err.message}`, { tone: 'error' });
+    } finally {
+        warmRuns.delete(prefix);
+        if (state.prefix === prefix) renderWarmBtn();
+    }
+}
+
 // ---------------------------------------------------------------- events
 
 function wireEvents() {
@@ -1318,6 +1366,8 @@ function wireEvents() {
     });
     ['images', 'videos', 'others'].forEach((name, i) => keys.on(String(i + 1), () => { if (viewer.isOpen() || dom.tabs[name].hidden) return false; selectSection(name); }));
     dom.filterChip.addEventListener('click', () => filter.clear());
+    dom.warmBtn.title = 'Load every preview and thumbnail in this folder through the CDN, so the first visitor to each is served from cache';
+    dom.warmBtn.addEventListener('click', () => warmFolder());
 
     // Uploads: button, key, file input, replace input, drag anywhere, paste.
     const pickFiles = () => { if (isPendingView()) { toast(NO_UPLOAD_HERE); return; } dom.fileInput.click(); };

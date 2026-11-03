@@ -711,6 +711,8 @@
     .appbar__actions { gap: 4px; }
     #upload-btn { width: var(--h-btn); padding: 0; }
     #upload-btn .btn__label { display: none; }
+    /* Leaves the media tabs their room; the label comes back to count progress. */
+    #warm-btn:not(.is-busy) .btn__label { display: none; }
     #help-btn { display: none; }
     .siterail { scroll-snap-type: x mandatory; mask-image: linear-gradient(90deg, #000 92%, transparent); -webkit-mask-image: linear-gradient(90deg, #000 92%, transparent); }
     main { padding-top: 12px; }

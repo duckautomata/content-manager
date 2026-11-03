@@ -1141,6 +1141,13 @@ _ip_hash_salt = secrets.token_bytes(16)
 _background_tasks: set[asyncio.Task] = set()
 
 
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
 def _hash_ip(ip: str) -> str:
     return hashlib.sha256(_ip_hash_salt + ip.encode("utf-8")).hexdigest()[:12]
 
@@ -1396,6 +1403,7 @@ async def upload_content(prefix: str = Form(...), override_filename: str = Form(
             content=content, mime=mime_type, original_ext=original_ext,
             original_name=file_name, prefix=prefix,
         )
+        _warm_in_background([result["preview"], result["thumbnail"]], f"upload of {result['preview']}")
         return {
             "status": "success",
             "type": "video" if is_video else "image",
@@ -1805,6 +1813,162 @@ async def purge_cache(req: CachePurgeRequest):
     if errors and not purged:
         raise HTTPException(status_code=502, detail=f"Cloudflare did not purge the cache: {errors[0]['error']}")
     return {"status": "success", "purged": purged, "errors": errors}
+
+
+# ---------------- CDN cache warmup ----------------
+
+# A new image only reaches the CDN when someone asks for it, so its first viewer
+# waits on a read from R2. Requesting the preview and thumbnail ahead of time puts
+# them in the cache, and with Cloudflare's Tiered Cache on that fills the upper
+# tier every data center asks first, so even the first view anywhere skips R2.
+# Originals are left out: the sites only open them on click, and a video can be
+# hundreds of MB. No Origin header is sent, because the sites load images with
+# plain <img> tags, which send none (see CLOUDFLARE_PURGE_ORIGINS for why the
+# header picks the cache entry).
+CACHE_WARM_SUFFIXES = ("_p.webp", "_t.webp")
+CACHE_WARM_CONCURRENCY = 8
+CACHE_WARM_MAX_ERRORS = 20
+# cf-cache-status when the copy was already cached in that data center, and when
+# it had to be fetched (and is cached now).
+_CACHE_STATUS_CACHED = frozenset({"HIT", "STALE", "UPDATING", "REVALIDATED"})
+_CACHE_STATUS_FETCHED = frozenset({"MISS", "EXPIRED"})
+# The latest folder warmup per prefix. In memory only: a restart forgets them.
+_warm_jobs: dict[str, dict] = {}
+
+
+class _QuietCdnRequests(logging.Filter):
+    """httpx2 logs every request at INFO, and a folder warmup makes one per file.
+    The warmup's own [bench] line sums them up instead."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        base = PUBLIC_URL_PREFIX.rstrip("/")
+        return not (base and record.getMessage().startswith(f"HTTP Request: GET {base}/"))
+
+
+logging.getLogger("httpx2").addFilter(_QuietCdnRequests())
+
+
+def _new_warm_job(prefix: str, total: int | None) -> dict:
+    return {
+        "prefix": prefix, "total": total, "done": 0, "cached": 0, "fetched": 0, "failed": 0,
+        "errors": [], "error": None, "started_at": _utc_now_iso(), "finished_at": None,
+    }
+
+
+async def _warm_one(client: httpx2.AsyncClient, key: str) -> tuple[str, str | None]:
+    """Fetch one file through the CDN. Returns ("cached" | "fetched" | "failed", problem)."""
+    try:
+        resp = await client.get(_public_url_for(key))
+    except httpx2.HTTPError as ex:
+        return "failed", f"{key}: {str(ex) or type(ex).__name__}"
+    if resp.status_code != 200:
+        return "failed", f"{key}: HTTP {resp.status_code}"
+    status = resp.headers.get("cf-cache-status", "").upper()
+    if status in _CACHE_STATUS_CACHED:
+        return "cached", None
+    if status in _CACHE_STATUS_FETCHED:
+        return "fetched", None
+    # BYPASS, DYNAMIC or no header: it was served, but the CDN kept no copy.
+    return "failed", f"{key}: not cached by the CDN (cf-cache-status: {status or 'missing'})"
+
+
+async def _warm_cdn_cache(keys: list[str], job: dict) -> None:
+    """Request every key's public URL through the CDN, counting each outcome into
+    `job` as it comes in so a poll can show progress."""
+    sem = asyncio.Semaphore(CACHE_WARM_CONCURRENCY)
+    async with httpx2.AsyncClient(timeout=30, headers={"User-Agent": "content-manager-cache-warmup"}) as client:
+        async def _one(key: str) -> None:
+            async with sem:
+                outcome, problem = await _warm_one(client, key)
+            job[outcome] += 1
+            job["done"] += 1
+            if problem and len(job["errors"]) < CACHE_WARM_MAX_ERRORS:
+                job["errors"].append(problem)
+
+        await asyncio.gather(*(_one(k) for k in keys))
+
+
+def _warm_in_background(keys: list[str], label: str) -> None:
+    """Warm freshly written files without holding up the response. The write
+    already succeeded, so a failed warmup is only logged."""
+    keys = [k for k in keys if k.endswith(CACHE_WARM_SUFFIXES)]
+    if not keys or not PUBLIC_URL_PREFIX:
+        return
+
+    async def _run() -> None:
+        job = _new_warm_job("", len(keys))
+        try:
+            await _warm_cdn_cache(keys, job)
+        except Exception:
+            logger.exception("Cache warmup after %s crashed", label)
+            return
+        if job["failed"]:
+            logger.warning(
+                "Cache warmup after %s: %d of %d failed: %s",
+                label, job["failed"], len(keys), "; ".join(job["errors"]),
+            )
+
+    _spawn_background(_run())
+
+
+async def _run_warm_job(job: dict) -> None:
+    bench = _Benchmark("warm-cache")
+    try:
+        with bench.stage("list"):
+            contents = await asyncio.to_thread(_list_all_objects, job["prefix"])
+        keys = [item["Key"] for item in contents if item["Key"].endswith(CACHE_WARM_SUFFIXES)]
+        job["total"] = len(keys)
+        with bench.stage("warm"):
+            await _warm_cdn_cache(keys, job)
+    except Exception as ex:
+        logger.exception("Cache warmup of %s failed", job["prefix"])
+        job["error"] = str(ex) or type(ex).__name__
+    finally:
+        job["finished_at"] = _utc_now_iso()
+        bench.log(
+            f"{job['prefix']} files={job['total']} cached={job['cached']} "
+            f"fetched={job['fetched']} failed={job['failed']}"
+        )
+
+
+def _warm_prefix(prefix: str) -> str:
+    key = prefix.strip().lstrip("/")
+    if not key:
+        raise HTTPException(status_code=400, detail="Pick a folder to warm")
+    key = key.rstrip("/") + "/"
+    if key.startswith(SUGGESTIONS_PREFIX):
+        raise HTTPException(status_code=400, detail="Pending uploads are not on the sites, so there is nothing to warm")
+    return key
+
+
+def _warm_job_view(job: dict) -> dict:
+    return {**job, "errors": list(job["errors"])}
+
+
+@app.post("/api/content/warm-cache", dependencies=[Depends(require_api_key)])
+async def warm_cache(prefix: str):
+    """Start loading every preview and thumbnail under `prefix` (subfolders
+    included) through the CDN. It runs in the background; poll GET for progress.
+    A warmup already running for the folder is returned instead of a second one."""
+    if not S3_CONFIGURED:
+        raise HTTPException(status_code=500, detail="S3 client not configured")
+    if not PUBLIC_URL_PREFIX:
+        raise HTTPException(status_code=503, detail="PUBLIC_URL_PREFIX is not set, so there is no CDN URL to warm")
+    key = _warm_prefix(prefix)
+    job = _warm_jobs.get(key)
+    if job is None or job["finished_at"] is not None:
+        job = _new_warm_job(key, None)
+        _warm_jobs[key] = job
+        _spawn_background(_run_warm_job(job))
+    return _warm_job_view(job)
+
+
+@app.get("/api/content/warm-cache", dependencies=[Depends(require_api_key)])
+async def warm_cache_status(prefix: str):
+    job = _warm_jobs.get(_warm_prefix(prefix))
+    if job is None:
+        raise HTTPException(status_code=404, detail="No warmup has run for this folder since the server started")
+    return _warm_job_view(job)
 
 
 # ---------------- File preview ----------------
@@ -2755,9 +2919,7 @@ async def public_submit_suggestion(req: PublicSuggestionRequest, request: Reques
     sample_url = None
     if images and PUBLIC_URL_PREFIX:
         sample_url = f"{PUBLIC_URL_PREFIX.rstrip('/')}/{PENDING_PREFIX}{images[0]['id']}_p.webp"
-    task = asyncio.create_task(_notify_discord(suggestion, sample_url))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    _spawn_background(_notify_discord(suggestion, sample_url))
 
     return {"id": sid}
 
@@ -2972,6 +3134,7 @@ async def _approve_suggestion(s: dict, bench: _Benchmark) -> dict:
         img["status"] = "approved"
         img["moved_to"] = f"{site}/{img['id']}{img['ext']}"
     s["status"] = "approved"
+    _warm_in_background([dst for _, dst in copies], f"approval of {s['id']}")
     return s
 
 
