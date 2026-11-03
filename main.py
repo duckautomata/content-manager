@@ -133,6 +133,33 @@ DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
 ADMIN_URL = os.environ.get("ADMIN_URL", "")
 IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS = int(os.environ.get("IMAGE_UPLOAD_NOTIFY_INTERVAL_SECONDS", "600"))
 
+# Cloudflare cache purge for data files. Images have content-addressed names and
+# never change, but a data file is overwritten under the same key and the CDN
+# keeps serving the old copy until its edge TTL runs out. The manager's "Purge
+# cache" buttons make a new version live at once. Needs a zone-scoped API token
+# with Zone → Cache Purge → Purge; the buttons are hidden while either is unset.
+CLOUDFLARE_ZONE_ID = os.environ.get("CLOUDFLARE_ZONE_ID", "").strip()
+CLOUDFLARE_PURGE_TOKEN = os.environ.get("CLOUDFLARE_PURGE_TOKEN", "").strip()
+# The sites fetch data files cross-origin, so each request carries an Origin
+# header. The bucket answers with `Vary: Origin` and Cloudflare keeps a separate
+# cache entry per Origin value, which a plain purge-by-URL leaves stale. Every URL
+# is purged once without an Origin and once with each of these.
+CLOUDFLARE_PURGE_ORIGINS = [
+    o.strip().rstrip("/")
+    for o in os.environ.get(
+        "CLOUDFLARE_PURGE_ORIGINS", "https://www.duck-automata.com,https://dev.duck-automata.com"
+    ).split(",")
+    if o.strip()
+]
+CACHE_PURGE_ENABLED = bool(CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN and PUBLIC_URL_PREFIX)
+CLOUDFLARE_API_URL = "https://api.cloudflare.com/client/v4"
+# Only files overwritten in place are worth purging.
+CACHE_PURGE_EXTENSIONS = frozenset({".csv", ".tsv", ".json"})
+CACHE_PURGE_MAX_KEYS = 100
+# Cloudflare caps the URLs in one purge call; a URL's variants count separately.
+CACHE_PURGE_BATCH_FILES = 30
+CACHE_PURGE_ATTEMPTS = 4
+
 # Concurrent R2 object operations (copies/uploads/deletes) issued per request.
 # R2 handles parallel object ops well; this only keeps a single request from
 # opening an unbounded number of connections.
@@ -179,6 +206,10 @@ if not ALLOWED_SITES:
     logger.warning("ALLOWED_SITES not set. Public suggestion API will reject all submissions.")
 if not TURNSTILE_ENABLED:
     logger.warning("TURNSTILE_ENABLED=false. Public endpoints will accept any request without captcha verification.")
+if bool(CLOUDFLARE_ZONE_ID) != bool(CLOUDFLARE_PURGE_TOKEN):
+    logger.warning("Only one of CLOUDFLARE_ZONE_ID / CLOUDFLARE_PURGE_TOKEN is set; cache purge disabled.")
+elif CLOUDFLARE_ZONE_ID and not PUBLIC_URL_PREFIX:
+    logger.warning("PUBLIC_URL_PREFIX not set; cache purge disabled since there is no URL to purge.")
 
 
 # ---------------- Lifespan ----------------
@@ -1214,6 +1245,10 @@ class BulkDeleteRequest(BaseModel):
     keys: list[str]
 
 
+class CachePurgeRequest(BaseModel):
+    keys: list[str]
+
+
 class ScheduleDeleteRequest(BaseModel):
     keys: list[str]
     delay_seconds: int
@@ -1326,6 +1361,8 @@ async def get_content(prefix: str):
         "csv_sources": csv_sources,
         # Where the public API parks visitor uploads; the manager offers it as a view.
         "pending_prefix": PENDING_PREFIX,
+        # Data file extensions the "Purge cache" buttons offer; empty when purge is not configured.
+        "cache_purge_extensions": sorted(CACHE_PURGE_EXTENSIONS) if CACHE_PURGE_ENABLED else [],
     }
 
 
@@ -1657,6 +1694,117 @@ async def sync_csv(prefix: str):
         logger.exception("Data file check failed for %s after the spreadsheet update", key)
         check_error = str(ex) or type(ex).__name__
     return {"status": "success", "updated": updated, "errors": errors, "check": check, "check_error": check_error}
+
+
+# ---------------- CDN cache purge ----------------
+
+def _public_url_for(key: str) -> str:
+    return f"{PUBLIC_URL_PREFIX.rstrip('/')}/{quote(key, safe='/')}"
+
+
+def _purge_variants(url: str) -> list:
+    """Every cache entry one URL can have: the plain one, plus one per Origin the
+    sites send (see CLOUDFLARE_PURGE_ORIGINS)."""
+    return [url] + [{"url": url, "headers": {"Origin": o}} for o in CLOUDFLARE_PURGE_ORIGINS]
+
+
+def _cloudflare_error(resp: httpx2.Response) -> str:
+    """The reason a Cloudflare API call failed, from its `errors` list when it has one."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    errs = body.get("errors") if isinstance(body, dict) else None
+    detail = "; ".join(
+        f"{e.get('message') or 'error'} (code {e.get('code')})" for e in errs or [] if isinstance(e, dict)
+    )
+    return f"HTTP {resp.status_code}: {detail}" if detail else f"HTTP {resp.status_code}"
+
+
+async def _purge_batch(client: httpx2.AsyncClient, files: list) -> str | None:
+    """One purge call. Rate limits, server errors and network failures are retried
+    with backoff; anything else (a bad token or zone) is final. Returns None on
+    success, else why it failed."""
+    url = f"{CLOUDFLARE_API_URL}/zones/{CLOUDFLARE_ZONE_ID}/purge_cache"
+    headers = {"Authorization": f"Bearer {CLOUDFLARE_PURGE_TOKEN}"}
+    error = ""
+    for attempt in range(1, CACHE_PURGE_ATTEMPTS + 1):
+        delay = 2 ** (attempt - 1)
+        try:
+            resp = await client.post(url, json={"files": files}, headers=headers)
+        except httpx2.HTTPError as ex:
+            error = f"request failed: {str(ex) or type(ex).__name__}"
+        else:
+            if resp.status_code == 200:
+                try:
+                    if resp.json().get("success") is True:
+                        return None
+                except (ValueError, AttributeError):
+                    pass
+                return _cloudflare_error(resp)
+            error = _cloudflare_error(resp)
+            if resp.status_code != 429 and resp.status_code < 500:
+                return error
+            retry_after = resp.headers.get("Retry-After", "")
+            if retry_after.isdigit():
+                delay = min(int(retry_after), 30)
+        if attempt < CACHE_PURGE_ATTEMPTS:
+            logger.warning(
+                "Cache purge attempt %d/%d failed (%s); retrying in %ds",
+                attempt, CACHE_PURGE_ATTEMPTS, error, delay,
+            )
+            await asyncio.sleep(delay)
+    return error
+
+
+async def _purge_cdn_cache(keys: list[str]) -> tuple[list[str], list[dict]]:
+    """Purge every cached copy of each key's public URL. Returns (purged keys,
+    [{key, error}] for the rest)."""
+    per_url = 1 + len(CLOUDFLARE_PURGE_ORIGINS)
+    # A URL's variants always share a call, so no URL is left half purged.
+    step = max(1, CACHE_PURGE_BATCH_FILES // per_url)
+    purged: list[str] = []
+    errors: list[dict] = []
+    async with httpx2.AsyncClient(timeout=15) as client:
+        for i in range(0, len(keys), step):
+            batch = keys[i:i + step]
+            files = [f for k in batch for f in _purge_variants(_public_url_for(k))]
+            error = await _purge_batch(client, files)
+            if error:
+                logger.error("Cache purge failed for %s: %s", ", ".join(batch), error)
+                errors.extend({"key": k, "error": error} for k in batch)
+            else:
+                purged.extend(batch)
+    if purged:
+        logger.info("Purged CDN cache for %s (%d variant(s) each)", ", ".join(purged), per_url)
+    return purged, errors
+
+
+@app.post("/api/content/purge-cache", dependencies=[Depends(require_api_key)])
+async def purge_cache(req: CachePurgeRequest):
+    """Drop the CDN's cached copies of data files so the next request gets the
+    version in the bucket instead of waiting out the edge TTL."""
+    if not CACHE_PURGE_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Cache purge is not configured: set CLOUDFLARE_ZONE_ID and CLOUDFLARE_PURGE_TOKEN",
+        )
+    keys = list(dict.fromkeys(k.strip() for k in req.keys if k.strip()))
+    if not keys:
+        raise HTTPException(status_code=400, detail="No keys to purge")
+    if len(keys) > CACHE_PURGE_MAX_KEYS:
+        raise HTTPException(status_code=400, detail=f"Cannot purge more than {CACHE_PURGE_MAX_KEYS} keys per request")
+    others = [k for k in keys if os.path.splitext(k)[1].lower() not in CACHE_PURGE_EXTENSIONS]
+    if others:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only data files ({', '.join(sorted(CACHE_PURGE_EXTENSIONS))}) can be purged: {', '.join(others[:5])}",
+        )
+
+    purged, errors = await _purge_cdn_cache(keys)
+    if errors and not purged:
+        raise HTTPException(status_code=502, detail=f"Cloudflare did not purge the cache: {errors[0]['error']}")
+    return {"status": "success", "purged": purged, "errors": errors}
 
 
 # ---------------- File preview ----------------

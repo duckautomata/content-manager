@@ -44,6 +44,7 @@ const state = {
     publicUrlPrefix: '',
     prefixes: cachedPrefixes(),
     csvSources: new Map(),      // filename -> {file, sheet_url}
+    purgeExts: new Set(),       // extensions the CDN cache can be purged for; empty when purge is not configured
     scheduledByKey: new Map(),  // R2 key -> scheduled-delete record
     previewCache: new Map(),    // `${key}|${last_modified}|${size}` -> preview payload
     latestPreview: new Map(),   // key -> most recent preview payload (for sync deltas)
@@ -65,7 +66,7 @@ const dom = {
     switcher: $('site-switcher'), pathBtn: $('path-btn'),
     folders: $('folders'), prefixNote: $('prefix-note'),
     dataPanel: $('data-panel'), dataCount: $('data-count'), dataFilterChip: $('data-filter-chip'),
-    syncBtn: $('sync-btn'), dataToggle: $('data-toggle'), dataBody: $('data-body'), dataRows: $('data-rows'), syncResult: $('sync-result'),
+    syncBtn: $('sync-btn'), purgeBtn: $('purge-btn'), dataToggle: $('data-toggle'), dataBody: $('data-body'), dataRows: $('data-rows'), syncResult: $('sync-result'),
     dataCheck: $('data-check'),
     sectionbar: $('sectionbar'), filterChip: $('filter-chip'),
     tabs: { images: $('tab-images'), videos: $('tab-videos'), others: $('tab-others') },
@@ -85,6 +86,7 @@ let refresh, filter, uploader, viewer, dataCheck;
 const keyOf = (name) => state.prefix + name;
 const urlFor = (key) => publicUrl(state.publicUrlPrefix, key);
 const isDataFile = (name) => state.csvSources.has(name);
+const isPurgeable = (name) => state.purgeExts.has(extOf(name));
 const siteOf = (prefix) => prefix.split('/').filter(Boolean)[0] || '';
 // The public API parks visitor uploads under this prefix; the manager shows it as its own view.
 const isPendingView = () => state.prefix === state.pendingPrefix;
@@ -234,6 +236,7 @@ async function load({ silent = false } = {}) {
             cachePrefixes(state.prefixes);
         }
         state.csvSources = new Map((data.csv_sources || []).map(s => [s.file, s]));
+        state.purgeExts = new Set(data.cache_purge_extensions || []);
         state.scheduledByKey = new Map();
         for (const rec of sched.scheduled || []) for (const k of rec.keys || []) state.scheduledByKey.set(k, rec);
         state.loaded = true;
@@ -374,6 +377,7 @@ function renderDataPanel() {
     for (const src of state.csvSources.values()) {
         dom.dataRows.append(makeDataRow(src, otherByName(src.file)));
     }
+    dom.purgeBtn.hidden = !purgeableDataKeys().length;
     dom.dataPanel.hidden = false;
     const phone = matchMedia('(max-width: 640px)').matches;
     dom.dataToggle.hidden = !phone;
@@ -565,6 +569,7 @@ function makeRow(item) {
     if (previewable) actions.append(el('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'view' }, 'aria-label': `View ${item.filename}` }, icon('eye'), el('span', { class: 'btn__label', text: 'View' })));
     const dl = urlFor(item.key);
     if (dl) actions.append(el('a', { class: 'btn btn--sm', href: dl, target: '_blank', rel: 'noopener noreferrer', title: 'Public CDN copy (may lag behind the bucket)', 'aria-label': `Download ${item.filename}` }, icon('download'), el('span', { class: 'btn__label', text: 'Download' })));
+    if (isPurgeable(item.filename)) actions.append(el('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'purge' }, title: PURGE_HINT, 'aria-label': `Purge the CDN cache for ${item.filename}` }, icon('zap'), el('span', { class: 'btn__label', text: 'Purge cache' })));
     actions.append(el('button', { type: 'button', class: 'btn btn--sm', dataset: { action: 'replace' }, 'aria-label': `Replace ${item.filename}` }, icon('swap'), el('span', { class: 'btn__label', text: 'Replace' })));
     actions.append(el('button', { type: 'button', class: 'btn btn--sm btn--danger', dataset: { action: 'delete' }, 'aria-label': `Delete ${item.filename}` }, icon('trash'), el('span', { class: 'btn__label', text: 'Delete' })));
     row.append(actions);
@@ -1115,6 +1120,7 @@ async function syncFromSheet(extraBusyBtn = null) {
         await load({ silent: true });
         const lines = [];
         let changed = 0;
+        const changedKeys = [];   // everything rewritten with new content, for the purge offer
         for (const s of sources) {
             const err = errors.find(e => e.file === s.file);
             if (err) {
@@ -1130,7 +1136,11 @@ async function syncFromSheet(extraBusyBtn = null) {
             const line = el('div', { class: 'notice__line' }, el('strong', { class: 'mono', text: s.file }));
             if (after && prev && prev.etag && prev.etag === after.etag) {
                 line.append(' unchanged (same content as before)');
-            } else if (after && after.kind === 'table') {
+                lines.push(line);
+                continue;
+            }
+            changedKeys.push(`${prefix}${s.file}`);
+            if (after && after.kind === 'table') {
                 changed++;
                 const rowsAfter = after.total_rows;
                 if (prev && prev.rows != null) {
@@ -1156,6 +1166,10 @@ async function syncFromSheet(extraBusyBtn = null) {
         }
         const tone = errors.length ? (updated.length ? 'warn' : 'danger') : 'success';
         lines.unshift(el('div', { class: 'notice__line' }, el('strong', null, `${errors.length ? 'Partly updated' : 'Updated'} at ${fmt.time(new Date().toISOString())}`), errors.length ? ` — ${errors.length} failed` : changed ? ` — ${fmt.plural(changed, 'file')} changed` : ' — nothing changed'));
+        // The sites keep getting the CDN's old copy until it expires, which is fine
+        // unless the change is urgent, so purging is offered rather than automatic.
+        const purgeKeys = changedKeys.filter(k => isPurgeable(k));
+        if (purgeKeys.length) lines.push(purgeOffer(purgeKeys));
         showSyncResult(tone, lines);
         // The server checked the image references in what it just wrote. The
         // report is about that folder, so it is not drawn if the page has moved on.
@@ -1195,6 +1209,48 @@ function showSyncResult(tone, lines) {
         el('button', { type: 'button', class: 'btn btn--sm btn--icon btn--ghost notice__close', 'aria-label': 'Dismiss', onclick: () => { box.hidden = true; } }, icon('x')),
     );
     box.hidden = false;
+}
+
+// ---- CDN cache purge
+
+const PURGE_HINT = 'Drop the CDN’s cached copy so the sites load the version in the bucket now, not when the cached one expires';
+
+// Data files in the panel that are in the bucket and can be purged.
+function purgeableDataKeys() {
+    return [...state.csvSources.keys()].map(otherByName).filter(o => o && isPurgeable(o.filename)).map(o => o.key);
+}
+
+// Resolves true when every key was purged.
+async function purgeCache(keysToPurge, { btn = null } = {}) {
+    if (!keysToPurge.length) { toast('There are no data files here to purge.'); return false; }
+    setBusy(btn, true, 'Purging…');
+    try {
+        const data = await apiJson('content/purge-cache', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keys: keysToPurge }) });
+        const names = (data.purged || []).map(k => k.split('/').pop()).join(', ');
+        const errors = data.errors || [];
+        if (errors.length) {
+            toast(`Purged ${names}, but ${fmt.plural(errors.length, 'file')} failed`, { tone: 'error', details: errors.map(e => `${e.key}: ${e.error}`).join('\n') });
+            return false;
+        }
+        toast(`Purged the CDN cache for ${names}. The next load gets the new copy, though a browser that fetched it in the last few minutes keeps its own until that expires.`, { tone: 'success', duration: 8000 });
+        return true;
+    } catch (err) {
+        if (!(err instanceof ApiError && err.status === 401)) toast(`Purge failed: ${err.detail || err.message}`, { tone: 'error' });
+        return false;
+    } finally {
+        setBusy(btn, false);
+    }
+}
+
+// The line under an update summary that offers to make the new files live now.
+function purgeOffer(keysToPurge) {
+    const line = el('div', { class: 'notice__line' }, 'The sites keep the CDN’s cached copy until it expires.');
+    const btn = el('button', { type: 'button', class: 'btn btn--sm', title: PURGE_HINT }, icon('zap'), el('span', { class: 'btn__label', text: 'Purge cache now' }));
+    btn.addEventListener('click', async () => {
+        if (await purgeCache(keysToPurge, { btn })) btn.replaceWith(el('span', { class: 'chip chip--success' }, icon('check'), 'Cache purged'));
+    });
+    line.append(btn);
+    return line;
 }
 
 // ---------------------------------------------------------------- events
@@ -1239,6 +1295,8 @@ function wireEvents() {
     });
 
     dom.syncBtn.addEventListener('click', () => syncFromSheet());
+    dom.purgeBtn.title = PURGE_HINT;
+    dom.purgeBtn.addEventListener('click', () => purgeCache(purgeableDataKeys(), { btn: dom.purgeBtn }));
     dom.dataToggle.addEventListener('click', () => { const open = dom.dataBody.hidden; setDataOpen(open); store.set(DATA_OPEN_KEY, open); });
 
     // Section tabs.
@@ -1311,7 +1369,9 @@ function rowAction(action, item, btn) {
         case 'replace': startReplace(item); break;
         case 'delete': deleteOther(item); break;
         case 'cancel-sched': { const rec = scheduledFor(item); if (rec) cancelSchedule(rec, item.filename); break; }
+        case 'purge': purgeCache([item.key], { btn }); break;
         case 'menu': openMenu(btn, [
+            ...(isPurgeable(item.filename) ? [{ label: 'Purge CDN cache', icon: 'zap', onSelect: () => purgeCache([item.key]) }] : []),
             { label: 'Replace…', icon: 'swap', onSelect: () => startReplace(item) },
             'sep',
             { label: 'Delete…', icon: 'trash', danger: true, onSelect: () => deleteOther(item) },
@@ -1356,11 +1416,13 @@ async function boot() {
                 last_modified: other ? other.last_modified : null,
                 sheet_url: src ? src.sheet_url : null,
                 isDataFile: !!src,
+                purgeable: !!other && isPurgeable(filename),
                 publicUrl: other ? urlFor(other.key) : '',
             };
         },
         fetchPreview,
         onSync: (_filename, btn) => syncFromSheet(btn),
+        onPurge: (filename, btn) => purgeCache([keyOf(filename)], { btn }),
         onClosed: () => updateTitle(),
     });
 

@@ -9,9 +9,9 @@ const SEEN_KEY = 'cm_seen';
 const URL_RE = /^https?:\/\/\S+$/i;
 const CHUNK = 500;
 
-// createViewer({root, contentEl, getPrefix, getFileInfo(filename) -> {key, size, last_modified, sheet_url, isDataFile, publicUrl} | null,
-//   fetchPreview(key, {force, signal}) -> Promise<preview>, onSync(filename, button) -> Promise, onClosed()})
-export function createViewer({ root, contentEl, getPrefix, getFileInfo, fetchPreview, onSync = null, onClosed = () => {} }) {
+// createViewer({root, contentEl, getPrefix, getFileInfo(filename) -> {key, size, last_modified, sheet_url, isDataFile, purgeable, publicUrl} | null,
+//   fetchPreview(key, {force, signal}) -> Promise<preview>, onSync(filename, button) -> Promise, onPurge(filename, button) -> Promise, onClosed()})
+export function createViewer({ root, contentEl, getPrefix, getFileInfo, fetchPreview, onSync = null, onPurge = null, onClosed = () => {} }) {
     let current = null;        // { filename, key, info, preview, pushed, restoreTo, ac, end }
     let closing = false;
     let seq = 0;
@@ -147,6 +147,11 @@ export function createViewer({ root, contentEl, getPrefix, getFileInfo, fetchPre
             const syncBtn = el('button', { type: 'button', class: 'btn btn--sm', title: 'Re-download this prefix’s data files from Google Sheets' }, icon('cloud-down'), el('span', { class: 'btn__label', text: 'Update' }));
             syncBtn.addEventListener('click', () => onSync(filename, syncBtn));
             tools.append(syncBtn);
+        }
+        if (info && info.purgeable && onPurge) {
+            const purgeBtn = el('button', { type: 'button', class: 'btn btn--sm', title: 'Drop the CDN’s cached copy so the sites load this version now' }, icon('zap'), el('span', { class: 'btn__label', text: 'Purge cache' }));
+            purgeBtn.addEventListener('click', () => onPurge(filename, purgeBtn));
+            tools.append(purgeBtn);
         }
         if (publicUrl) {
             const copyBtn = el('button', { type: 'button', class: 'btn btn--sm btn--ghost', title: publicUrl }, icon('link'), el('span', { class: 'btn__label', text: 'Copy URL' }));

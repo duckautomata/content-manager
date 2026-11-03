@@ -76,6 +76,7 @@
         <symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
         <symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
         <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+        <symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
         <symbol id="i-loader" viewBox="0 0 24 24"><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93"/></symbol>
     </svg>
 
@@ -130,10 +131,16 @@
                         <span class="chip" id="data-count">0</span>
                     </h2>
                     <span class="chip" id="data-filter-chip" hidden></span>
-                    <button type="button" class="btn btn--sm push" id="sync-btn" aria-label="Update from spreadsheet">
-                        <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-cloud-down"/></svg>
-                        <span class="btn__label btn__label--long">Update from spreadsheet</span><span class="btn__label btn__label--short">Update</span>
-                    </button>
+                    <div class="panel__tools push">
+                        <button type="button" class="btn btn--sm" id="sync-btn" aria-label="Update from spreadsheet">
+                            <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-cloud-down"/></svg>
+                            <span class="btn__label btn__label--long">Update from spreadsheet</span><span class="btn__label btn__label--short">Update</span>
+                        </button>
+                        <button type="button" class="btn btn--sm" id="purge-btn" aria-label="Purge the CDN cache for these data files" hidden>
+                            <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-zap"/></svg>
+                            <span class="btn__label btn__label--long">Purge cache</span><span class="btn__label btn__label--short">Purge</span>
+                        </button>
+                    </div>
                     <button type="button" class="btn btn--sm btn--icon btn--ghost" id="data-toggle" aria-expanded="true" aria-controls="data-body" aria-label="Collapse data files" hidden>
                         <svg class="icon" aria-hidden="true" focusable="false"><use href="#i-chevron-up"/></svg>
                     </button>

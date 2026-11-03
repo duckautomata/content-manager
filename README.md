@@ -384,9 +384,63 @@ count, size and last-modified time, and offers:
   matching file, then reports per file what changed (rows before → after, or
   "unchanged" when the content is identical) and flags a drop of 50% or more. The
   [image check](#image-check) then runs on the folder, and its result shows under
-  that report.
+  that report. When files changed and [cache purge](#cdn-cache-purge) is set up, the
+  report offers **Purge cache now**.
+- **Purge cache** — drops the CDN's cached copy of every data file in the panel; see
+  [CDN cache purge](#cdn-cache-purge). A single file can be purged from its **⋯** menu.
 
 Other text files in a prefix (`.json`, `.txt`, `.md`, …) get the same **View** action.
+
+### CDN cache purge
+
+Images are stored under content-addressed names that never change, so the CDN can keep
+them for as long as it likes. Data files (`.csv`, `.tsv`, `.json`) are overwritten in
+place under the same key, and the CDN keeps serving the old copy until its edge TTL runs
+out. That is usually fine. When a change can't wait, the manager can purge the cached
+copy so the next request is fetched fresh from the bucket.
+
+Purging is never automatic. It is offered in these places:
+
+- **Purge cache** in the **Data files** panel header, for every data file in the panel.
+- **Purge CDN cache** in a data file row's **⋯** menu, for that one file.
+- **Purge cache** on any `.csv` / `.tsv` / `.json` row under **Other**, which covers
+  prefixes with no spreadsheet sources (e.g. `dokimosaic/tiles.json`).
+- **Purge cache** in the viewer toolbar of such a file.
+- **Purge cache now** under an **Update from spreadsheet** report, for the files it changed.
+
+Set these to turn it on (the buttons stay hidden until both are set):
+
+```
+CLOUDFLARE_ZONE_ID=<zone id of the domain serving PUBLIC_URL_PREFIX>
+CLOUDFLARE_PURGE_TOKEN=<zone-scoped API token: Zone → Cache Purge → Purge>
+# CLOUDFLARE_PURGE_ORIGINS=https://www.duck-automata.com,https://dev.duck-automata.com
+```
+
+**Why the Origin list exists.** The sites fetch data files cross-origin, so the browser
+sends `Origin: https://www.duck-automata.com`. The bucket's CORS response carries
+`Vary: Origin`, and Cloudflare keeps a separate cache entry per Origin value. A plain
+purge-by-URL, which is what the dashboard does, only clears the entry with no Origin, and
+the one the site actually uses stays stale. So each file's public URL
+(`PUBLIC_URL_PREFIX/<key>`) is purged without an Origin header and once more with each
+of `CLOUDFLARE_PURGE_ORIGINS`, all in the same API call. The apex
+`https://duck-automata.com` redirects to `www`, so it needs no entry of its own.
+
+Calls go out in batches of at most 30 purge entries. Rate limits (`429`) and server
+errors (`5xx`) are retried with backoff (honouring `Retry-After`); any other failure,
+such as a bad token, is reported straight away and logged.
+
+A purge clears the CDN, not browsers. A browser that fetched the file within its
+`Cache-Control` max-age keeps its own copy until that runs out, so to check a purge from
+a browser you already used, open the file in a private window or watch the response
+headers:
+
+```bash
+curl -s -D - -o /dev/null -H "Origin: https://www.duck-automata.com" \
+  https://content.duck-automata.com/dokinomicon/data.csv | grep -iE "cf-cache-status|age|etag"
+```
+
+Right after a purge this shows `cf-cache-status: MISS`, then `HIT` on the next request,
+and the `etag` matches the object's MD5 in R2.
 
 #### Automatic sync
 
@@ -507,9 +561,10 @@ Content (used by the manager page):
 
 | Method | Path                                          | Purpose                                                  |
 |--------|-----------------------------------------------|----------------------------------------------------------|
-| GET    | `/api/content?prefix=`                        | Grouped listing: `images`, `videos`, `others`, `public_url_prefix`, `common_prefixes`, and `csv_sources` as `[{file, sheet_url}]` for the prefix |
+| GET    | `/api/content?prefix=`                        | Grouped listing: `images`, `videos`, `others`, `public_url_prefix`, `common_prefixes`, `csv_sources` as `[{file, sheet_url}]` for the prefix, and `cache_purge_extensions` (empty when [cache purge](#cdn-cache-purge) is not configured) |
 | GET    | `/api/content/preview?key=`                   | Parsed contents of a text-ish object for the in-app viewer. CSV/TSV → `{kind: "table", header, rows, total_rows, truncated, row_limit, …}` (first 5000 rows); other text → `{kind: "text", text, total_chars, truncated}`. Also `size`, `last_modified`, `etag`, `encoding`. `404` missing, `413` over 8 MB, `415` binary/unsupported, `422` unparseable CSV. Successful responses carry `Cache-Control: no-store`. |
 | POST   | `/api/content/sync-csv?prefix=`               | Re-download the prefix's configured sheet tabs → `{updated, errors, check, check_error}`. `check` is the [Image check](#image-check) of the prefix's CSV/TSV files, run once the new ones are written, or `null` with the reason in `check_error` when the check itself failed (the update still answers `200`): `{prefix, checked_at, refs, errors, unreferenced, unreferenced_count, files: [{file, sheet_url, columns, rows, refs, problems, problem_count, error, encoding}]}`, each problem `{row, column, cell, id, ext, code, message, fix}` plus `found` (wrong_ext) and `elsewhere` (missing_image). `errors` counts every problem, including those past the 200 listed per file. `502`, with no check, when every file failed. |
+| POST   | `/api/content/purge-cache`                    | `{keys}` — purge the CDN copies of up to 100 `.csv`/`.tsv`/`.json` objects (see [CDN cache purge](#cdn-cache-purge)) → `{purged, errors: [{key, error}]}`. `400` for other file types, `502` when nothing was purged, `503` when not configured. |
 | POST   | `/api/upload`                                 | multipart `prefix`, `file`, optional `override_filename` |
 | DELETE | `/api/content?key=`                           | Delete one object                                        |
 | POST   | `/api/content/bulk-delete`                    | `{keys}` — delete up to 1000 objects                     |

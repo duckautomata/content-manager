@@ -603,6 +603,7 @@
   .panel__head { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--border); }
   .panel__title { display: inline-flex; align-items: center; gap: 8px; font-size: var(--fs-lg); font-weight: 600; }
   .panel__head .push { margin-left: auto; }
+  .panel__tools { display: flex; align-items: center; gap: 6px; }
   .panel__body { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
   .panel--data .rows { gap: 6px; }
   #sync-result { margin-top: 4px; }
@@ -717,6 +718,10 @@
     .viewer__bar { margin-top: -12px; }
     html { scroll-padding-top: var(--h-sectionbar); }
     .panel__head { padding: 6px 8px 6px 12px; }
+    /* Title and collapse toggle on top, the panel's buttons sharing a line below. */
+    .panel--data .panel__head { flex-wrap: wrap; row-gap: 8px; }
+    #data-toggle { order: 1; margin-left: auto; }
+    .panel--data .panel__tools { order: 2; flex: 1 1 100%; margin-left: 0; display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 8px; }
     .panel__body { padding: 8px; }
     .row { grid-template-columns: 20px minmax(0, 1fr); }
     .row__actions { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
